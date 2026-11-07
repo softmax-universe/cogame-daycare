@@ -111,7 +111,7 @@ Batch elapsed time is recorded separately: synchronous batch return does not mea
 latency. The native Curly header API does not expose a lossless original HTTP-header byte stream.
 
 The writer is reused without changes from the MIT-licensed
-[Bitworld decision trajectory module](https://github.com/Metta-AI/bitworld/blob/c336f54e10e9028d9cfbda540ee085ac7627fbb3/src/bitworld/decision_trajectory.nim),
+[Bitworld decision trajectory module](https://github.com/softmax-universe/bitworld/blob/c336f54e10e9028d9cfbda540ee085ac7627fbb3/src/bitworld/decision_trajectory.nim),
 using the already reviewed runtime import adaptation.
 
 `scenario_family` identifies canonical unmirrored physical yard configuration. Seed, role swaps, horizon and prompt
