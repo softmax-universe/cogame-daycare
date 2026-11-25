@@ -86,9 +86,9 @@ for variant in AllVariants:
   doAssert doc["results"]["scores"][0].getInt() ==
     doc["results"]["scores"][1].getInt(), where & "the mirror broke"
   doAssert doc["results"]{"reason"}.getStr() in
-    ["complete", "deadline", "forfeit"]
+    ["complete", "deadline"]
   doAssert doc["results"]{"ending"}.getStr() in
-    ["turn_limit", "deadline", "forfeit"]
+    ["turn_limit", "deadline"]
 
   # The frame encoding: 4 ints per cog, 4 per ground fruit, 2 per source.
   for frame in doc["frames"]:

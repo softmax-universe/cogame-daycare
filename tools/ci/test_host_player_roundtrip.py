@@ -51,7 +51,7 @@ def wait_healthz(port: int, timeout_s: float = 10.0) -> None:
     raise TimeoutError(f"game server on port {port} did not become healthy")
 
 
-def make_stub_server(mode: str):
+def make_stub_server(mode: str, on_call=None):
     calls = []
 
     class Handler(http.server.BaseHTTPRequestHandler):
@@ -60,6 +60,8 @@ def make_stub_server(mode: str):
             req = json.loads(raw.decode("utf-8"))
             slot = int(self.headers.get("X-Coworld-Player-Slot", "0"))
             calls.append({"slot": slot, "mode": mode})
+            if on_call is not None:
+                on_call(len(calls), slot)
             if mode == "provider_500":
                 body = json.dumps({"error": "upstream 500"}).encode()
                 self.send_response(500)
@@ -122,7 +124,13 @@ def make_stub_server(mode: str):
 
 
 def run_scenario(game_bin: Path, player_bin: Path, name: str, mode: str,
-                 scripted_seats: tuple[str, str] = ("", ""), use_llm: bool = True):
+                 scripted_seats: tuple[str, str] = ("", ""), use_llm: bool = True,
+                 connect_slots: tuple[int, ...] = (0, 1),
+                 connect_timeout_s: int = 10, min_turn_s: int = 0,
+                 disconnect_slot: int | None = None,
+                 disconnect_on_call: int | None = None,
+                 disconnect_delay_s: float = 0.0,
+                 expected_seat: int | None = None):
     with tempfile.TemporaryDirectory(prefix=f"daycare-rt-{name}-") as td:
         work = Path(td)
         port = free_port()
@@ -130,19 +138,37 @@ def run_scenario(game_bin: Path, player_bin: Path, name: str, mode: str,
             "seed": 7,
             "turns": 2,
             "ticksPerTurn": 60,
-            "minTurnSeconds": 0,
+            "minTurnSeconds": min_turn_s,
             "llmTimeoutSeconds": 5,
             "shutdownGraceSeconds": 0,
-            "playerConnectTimeoutSeconds": 10,
+            "playerConnectTimeoutSeconds": connect_timeout_s,
             "num_agents": 2,
             "players": [{"name": "Alder"}, {"name": "Bramble"}],
             "tokens": ["tok0", "tok1"],
         }
         (work / "config.json").write_text(json.dumps(cfg))
 
+        players_by_slot: dict[int, subprocess.Popen] = {}
+
+        def on_call(call_num: int, _slot: int):
+            if disconnect_slot is not None and disconnect_on_call == call_num:
+                proc = players_by_slot.get(disconnect_slot)
+                if proc is not None and proc.poll() is None:
+                    if disconnect_delay_s > 0:
+                        def _drop():
+                            time.sleep(disconnect_delay_s)
+                            if proc.poll() is None:
+                                proc.terminate()
+                                proc.wait(timeout=5)
+                        threading.Thread(target=_drop, daemon=True).start()
+                    else:
+                        proc.terminate()
+                        proc.wait(timeout=5)
+                        time.sleep(0.25)
+
         srv, calls = (None, [])
         if use_llm:
-            srv, calls = make_stub_server(mode)
+            srv, calls = make_stub_server(mode, on_call=on_call)
 
         base_env = {
             k: os.environ[k]
@@ -177,7 +203,7 @@ def run_scenario(game_bin: Path, player_bin: Path, name: str, mode: str,
         players = []
         try:
             wait_healthz(port)
-            for slot in (0, 1):
+            for slot in connect_slots:
                 penv = base_env | {
                     "COWORLD_PLAYER_WS_URL": f"ws://127.0.0.1:{port}/player?slot={slot}&token=tok{slot}"
                 }
@@ -193,18 +219,20 @@ def run_scenario(game_bin: Path, player_bin: Path, name: str, mode: str,
                     text=True,
                 )
                 players.append(p)
+                players_by_slot[slot] = p
 
             game_out, _ = game.communicate(timeout=30)
-            for p in players:
+            for slot, p in players_by_slot.items():
                 p.wait(timeout=10)
-                assert p.returncode == 0, f"{name}: player exited {p.returncode}"
+                if slot != disconnect_slot:
+                    assert p.returncode == 0, f"{name}: player {slot} exited {p.returncode}"
 
             results_exists = (work / "results.json").exists()
             replay_exists = (work / "replay.json").exists()
             failure_exists = (work / "player_failure.json").exists()
             traj_path = work / "trajectory.jsonl"
 
-            if mode == "valid":
+            if mode == "valid" and disconnect_slot is None and len(connect_slots) == 2:
                 assert game.returncode == 0, f"{name}: game failed: {game_out}"
                 assert results_exists and replay_exists and not failure_exists
                 results = json.loads((work / "results.json").read_text())
@@ -239,8 +267,15 @@ def run_scenario(game_bin: Path, player_bin: Path, name: str, mode: str,
                 assert not replay_exists, f"{name}: replay.json must NOT be written on failure"
                 assert failure_exists, f"{name}: player_failure.json missing\n{game_out}"
                 failure = json.loads((work / "player_failure.json").read_text())
-                expected_cause = "invalid_action" if mode == "ambiguous" else "infra_error"
+                if disconnect_slot is not None or len(connect_slots) < 2:
+                    expected_cause = "player_error"
+                elif mode == "ambiguous":
+                    expected_cause = "invalid_action"
+                else:
+                    expected_cause = "infra_error"
                 assert failure["cause"] == expected_cause, f"{name}: {failure}"
+                if expected_seat is not None:
+                    assert failure["seat"] == expected_seat, f"{name}: expected seat {expected_seat}, got {failure}"
                 assert "scores" not in failure and "win" not in failure
                 if traj_path.exists():
                     traj_rows = [json.loads(l) for l in traj_path.read_text().splitlines() if l.strip()]
@@ -275,6 +310,51 @@ def main():
     run_scenario(args.game, args.player, "invalid_ambiguous_object", "ambiguous", use_llm=True)
     run_scenario(args.game, args.player, "provider_http_500", "provider_500", use_llm=True)
     run_scenario(args.game, args.player, "missing_credentials", "missing_creds", use_llm=False)
+    run_scenario(
+        args.game,
+        args.player,
+        "startup_zero_seats_missing",
+        "valid",
+        use_llm=False,
+        connect_slots=(),
+        connect_timeout_s=1,
+        expected_seat=-1,
+    )
+    run_scenario(
+        args.game,
+        args.player,
+        "startup_one_seat_missing",
+        "valid",
+        scripted_seats=("caretaker", "stubborn"),
+        use_llm=False,
+        connect_slots=(0,),
+        connect_timeout_s=1,
+        expected_seat=1,
+    )
+    run_scenario(
+        args.game,
+        args.player,
+        "midgame_model_seat_disconnect",
+        "valid",
+        scripted_seats=("", "caretaker"),
+        use_llm=True,
+        disconnect_slot=0,
+        disconnect_on_call=2,
+        expected_seat=0,
+    )
+    run_scenario(
+        args.game,
+        args.player,
+        "midgame_between_turns_disconnect",
+        "valid",
+        scripted_seats=("", "caretaker"),
+        use_llm=True,
+        min_turn_s=1,
+        disconnect_slot=1,
+        disconnect_on_call=1,
+        disconnect_delay_s=0.35,
+        expected_seat=1,
+    )
     run_scenario(
         args.game,
         args.player,
