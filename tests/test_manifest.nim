@@ -79,17 +79,31 @@ block:
   doAssert certCfg.minTurnSeconds == 0,
     "the cert fixture must not pace: it has no credentials to wait for"
 
-echo "test_manifest: first player is native model player; certification uses explicit scripted seats"
+echo "test_manifest: first player is native model player; certification seats every declared ID"
 block:
-  doAssert manifest["player"].len == 3, $manifest["player"].len
+  let gameEnv = manifest["game"]["runnable"]["env"]
+  doAssert gameEnv{"COWORLD_LLM_ENABLED"}.getStr() == "true",
+    "game.runnable.env must explicitly set COWORLD_LLM_ENABLED=true for server-side inference"
+  doAssert gameEnv{"COWORLD_LLM_MODEL"}.getStr() == "anthropic/claude-haiku-4.5",
+    "game.runnable.env must explicitly set default COWORLD_LLM_MODEL"
+
+  doAssert manifest["player"].len == 2, $manifest["player"].len
   let first = manifest["player"][0]
   doAssert first["id"].getStr() == "daycare-player",
     "first player entry must be the native model player daycare-player"
   doAssert first["run"][0].getStr() == "/bin/daycare-player"
   doAssert first["env"]{"COWORLD_LLM_ENABLED"}.getStr() == "true",
     "native model player must explicitly set COWORLD_LLM_ENABLED=true"
+  doAssert first["env"]{"COWORLD_LLM_MODEL"}.getStr() == "anthropic/claude-haiku-4.5",
+    "native model player must explicitly set default COWORLD_LLM_MODEL"
   doAssert first["env"]{"PLAYER_SCRIPTED"}.isNil,
     "native model player must not set PLAYER_SCRIPTED"
+
+  let second = manifest["player"][1]
+  doAssert second["id"].getStr() == "daycare-caretaker",
+    "second bundled player entry must be daycare-caretaker"
+  doAssert second["env"]{"PLAYER_SCRIPTED"}.getStr() == "caretaker"
+
   var declared: seq[string]
   for entry in manifest["player"]:
     let id = entry["id"].getStr()
@@ -103,8 +117,11 @@ block:
     let id = slot["player_id"].getStr()
     seated.add id
     doAssert id in declared, id & " is not declared in manifest.player"
-  doAssert seated == @["daycare-caretaker", "daycare-stubborn"],
-    "offline certification must seat the explicit scripted baselines: " & $seated
+  for id in declared:
+    doAssert id in seated,
+      "declared player " & id & " must be seated in certification.players"
+  doAssert seated == @["daycare-player", "daycare-caretaker"],
+    "release certification must seat native model player and bundled baseline: " & $seated
 
 echo "test_manifest: the replay ships as a STATIC bundle, never a pod"
 block:
@@ -301,12 +318,14 @@ block:
   for name in names:
     doAssert not seen.hasKey(name), "duplicate policy name " & name
     seen[name] = true
-  # Both scripted names are declared player entries too, so the smoke and the
-  # certifier field the same seats the league does.
+  # Caretaker is bundled in manifest.player alongside the native model player
+  # (2 seats = 2 bundled IDs); stubborn remains a separately uploaded policy.
   var declared: seq[string]
   for entry in manifest["player"]:
     declared.add entry["id"].getStr()
-  doAssert "daycare-caretaker" in declared and "daycare-stubborn" in declared
+  doAssert "daycare-caretaker" in declared
+  doAssert "daycare-stubborn" notin declared
+  doAssert "daycare-stubborn" in names
 
 echo "test_manifest: the scaffold is present and has no unsubstituted " &
   "placeholders"

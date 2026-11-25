@@ -214,20 +214,25 @@ def run_scenario(game_bin: Path, player_bin: Path, name: str, mode: str,
                 assert results["turns"] == 2
                 assert isinstance(results["scores"], list) and len(results["scores"]) == 2
                 if use_llm:
-                    assert len(calls) == 4, f"expected 4 model calls, got {len(calls)}"
+                    llm_seats = sum(1 for s in scripted_seats if not s)
+                    expected_calls = 2 * llm_seats
+                    assert len(calls) == expected_calls, f"expected {expected_calls} model calls, got {len(calls)}"
                     order_events = [e for e in replay["events"] if e.get("k") == "order"]
                     assert len(order_events) == 4
-                    assert all(e["source"] == "llm" for e in order_events)
+                    llm_orders = [e for e in order_events if e["source"] == "llm"]
+                    assert len(llm_orders) == expected_calls
                     traj_rows = [json.loads(l) for l in traj_path.read_text().splitlines() if l.strip()]
                     dec_rows = [r for r in traj_rows if r["event_type"] == "decision"]
                     assert len(dec_rows) == 4
-                    assert all(r["action_status"] == "accepted" for r in dec_rows), dec_rows
-                    assert dec_rows[0]["observation"]["native_execution"]["ancillary_normalized"] == {
+                    llm_dec_rows = [r for r in dec_rows if not scripted_seats[int(r["seat"])]]
+                    assert len(llm_dec_rows) == expected_calls
+                    assert all(r["action_status"] == "accepted" for r in llm_dec_rows), llm_dec_rows
+                    assert llm_dec_rows[0]["observation"]["native_execution"]["ancillary_normalized"] == {
                         "hunch_clipped": True,
                         "notes_clipped": True,
                     }
-                    assert "H" * 110 in dec_rows[0]["attempts"][0]["response"]
-                    assert "N" * 265 in dec_rows[0]["attempts"][0]["response"]
+                    assert "H" * 110 in llm_dec_rows[0]["attempts"][0]["response"]
+                    assert "N" * 265 in llm_dec_rows[0]["attempts"][0]["response"]
             else:
                 assert game.returncode != 0, f"{name}: expected non-zero exit, got 0\n{game_out}"
                 assert not results_exists, f"{name}: results.json must NOT be written on failure"
@@ -259,6 +264,14 @@ def main():
     args = parser.parse_args()
 
     run_scenario(args.game, args.player, "valid_bare_and_fenced_clipped", "valid", use_llm=True)
+    run_scenario(
+        args.game,
+        args.player,
+        "cert_mix_model_vs_caretaker",
+        "valid",
+        scripted_seats=("", "caretaker"),
+        use_llm=True,
+    )
     run_scenario(args.game, args.player, "invalid_ambiguous_object", "ambiguous", use_llm=True)
     run_scenario(args.game, args.player, "provider_http_500", "provider_500", use_llm=True)
     run_scenario(args.game, args.player, "missing_credentials", "missing_creds", use_llm=False)

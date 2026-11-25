@@ -96,8 +96,11 @@ mechanically rather than by convention. Every recorded string is truncated on **
 An invalid prompt reply is retried once with a hint; if a seat still fails to produce a valid order (or disconnects,
 times out, hits a provider/transport error, or runs a prompt seat without LLM credentials), the unfinished episode
 terminates unscored with failure diagnostics (`COGAME_PLAYER_FAILURE_URI` / non-zero exit, no `results.json`) rather
-than silently substituting a scripted move or inventing a forfeit score. Offline certification uses the explicit
-scripted baselines (`daycare-caretaker` and `daycare-stubborn`), which require no LLM credentials.
+than silently substituting a scripted move or inventing a forfeit score. The release certification fixture seats the
+native model player (`daycare-player`) alongside the bundled scripted baseline (`daycare-caretaker`); `daycare-stubborn`
+remains available as a separately uploaded policy (`tools/ci/policies.json`) or via
+`--run /bin/daycare-player --secret-env PLAYER_SCRIPTED=stubborn`, and offline scripted smoke/tests explicitly pass
+`PLAYER_SCRIPTED`.
 
 Full per-role schema: `game.docs.pages[policies.md]` in `coworld_manifest_template.json`.
 

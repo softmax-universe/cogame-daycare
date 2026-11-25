@@ -23,7 +23,10 @@
       "run": [
         "/bin/daycare"
       ],
-      "env": {},
+      "env": {
+        "COWORLD_LLM_ENABLED": "true",
+        "COWORLD_LLM_MODEL": "anthropic/claude-haiku-4.5"
+      },
       "source_url": "https://github.com/softmax-universe/cogame-daycare/tree/main"
     },
     "config_schema": {
@@ -459,7 +462,8 @@
         "/bin/daycare-player"
       ],
       "env": {
-        "COWORLD_LLM_ENABLED": "true"
+        "COWORLD_LLM_ENABLED": "true",
+        "COWORLD_LLM_MODEL": "anthropic/claude-haiku-4.5"
       },
       "resources": {
         "requests": {
@@ -483,29 +487,6 @@
       ],
       "env": {
         "PLAYER_SCRIPTED": "caretaker"
-      },
-      "resources": {
-        "requests": {
-          "cpu": "100m",
-          "memory": "64Mi"
-        },
-        "limits": {
-          "cpu": "1"
-        }
-      },
-      "source_url": "https://github.com/softmax-universe/cogame-daycare/tree/main"
-    },
-    {
-      "id": "daycare-stubborn",
-      "name": "Daycare Stubborn Baseline",
-      "type": "player",
-      "description": "The anti-theory-of-mind foil: as the PARENT it provides apples and guesses apple every turn forever, ignoring the child entirely; as the CHILD it grazes -- eats whatever is nearest, never reaches at a tall tree, and therefore emits no species signal at all. One exception keeps a stubborn pair off a guaranteed zero: after four turns without a meal the child begs for one turn.",
-      "image": "{{DAYCARE_IMAGE}}",
-      "run": [
-        "/bin/daycare-player"
-      ],
-      "env": {
-        "PLAYER_SCRIPTED": "stubborn"
       },
       "resources": {
         "requests": {
@@ -634,10 +615,10 @@
     },
     "players": [
       {
-        "player_id": "daycare-caretaker"
+        "player_id": "daycare-player"
       },
       {
-        "player_id": "daycare-stubborn"
+        "player_id": "daycare-caretaker"
       }
     ]
   }

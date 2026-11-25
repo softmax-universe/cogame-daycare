@@ -191,9 +191,13 @@ jobs:
       - name: Raw-Docker episode smoke
         # SMOKE_SLUG is passed explicitly so the workflow's SLUG is the single
         # source for the game/player entrypoint names; the script's own
-        # scaffold-substituted default is only a fallback.
+        # scaffold-substituted default is only a fallback. Offline CI has no
+        # LLM credentials/sidecar, so it explicitly overrides the smoke seats
+        # to scripted caretaker while leaving the manifest's release
+        # certification fixture (daycare-player + daycare-caretaker) untouched.
         env:
           SMOKE_SLUG: ${{ env.SLUG }}
+          SMOKE_EXTRA_ENV: PLAYER_SCRIPTED=caretaker
         run: ./tools/ci/docker_smoke.sh "${IMAGE}:ci"
 
       # The replay this episode produced is the ONLY replay in CI that is
