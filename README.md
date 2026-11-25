@@ -94,9 +94,10 @@ returned to it next turn. Neither ever reaches the other seat — that is how "n
 mechanically rather than by convention. Every recorded string is truncated on **rune** boundaries.
 
 An invalid prompt reply is retried once with a hint; if a seat still fails to produce a valid order (or disconnects,
-times out, or runs a prompt seat without LLM credentials), the episode forfeits (`reason="forfeit"`, `ending="forfeit"`)
-rather than silently substituting a scripted move. Offline certification uses the explicit scripted baselines
-(`daycare-caretaker` and `daycare-stubborn`), which require no LLM credentials.
+times out, hits a provider/transport error, or runs a prompt seat without LLM credentials), the unfinished episode
+terminates unscored with failure diagnostics (`COGAME_PLAYER_FAILURE_URI` / non-zero exit, no `results.json`) rather
+than silently substituting a scripted move or inventing a forfeit score. Offline certification uses the explicit
+scripted baselines (`daycare-caretaker` and `daycare-stubborn`), which require no LLM credentials.
 
 Full per-role schema: `game.docs.pages[policies.md]` in `coworld_manifest_template.json`.
 

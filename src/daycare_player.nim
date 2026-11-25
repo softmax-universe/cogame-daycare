@@ -75,7 +75,11 @@ when isMainModule:
           ## raced the server's slot registration.
           socket.send(promptFrame())
         of "final":
-          echo "daycare player: final scores ", payload{"scores"}
+          if payload{"failed"}.getBool():
+            echo "daycare player: episode failed (",
+              payload{"cause"}.getStr(), "): ", payload{"error"}.getStr()
+          else:
+            echo "daycare player: final scores ", payload{"scores"}
           break
         else:
           discard

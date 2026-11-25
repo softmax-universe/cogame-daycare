@@ -79,24 +79,32 @@ block:
   doAssert certCfg.minTurnSeconds == 0,
     "the cert fixture must not pace: it has no credentials to wait for"
 
-echo "test_manifest: every declared player entry occupies a certification slot"
+echo "test_manifest: first player is native model player; certification uses explicit scripted seats"
 block:
-  # `players-run` seats the whole roster; a fixture that omits one fails
-  # `players_missing` (raid 0.1.2 -> 0.1.3).
-  doAssert manifest["player"].len == 2, $manifest["player"].len
-  var seated: seq[string]
-  for slot in manifest["certification"]["players"]:
-    seated.add slot["player_id"].getStr()
+  doAssert manifest["player"].len == 3, $manifest["player"].len
+  let first = manifest["player"][0]
+  doAssert first["id"].getStr() == "daycare-player",
+    "first player entry must be the native model player daycare-player"
+  doAssert first["run"][0].getStr() == "/bin/daycare-player"
+  doAssert first["env"]{"COWORLD_LLM_ENABLED"}.getStr() == "true",
+    "native model player must explicitly set COWORLD_LLM_ENABLED=true"
+  doAssert first["env"]{"PLAYER_SCRIPTED"}.isNil,
+    "native model player must not set PLAYER_SCRIPTED"
+  var declared: seq[string]
   for entry in manifest["player"]:
     let id = entry["id"].getStr()
-    doAssert id in seated, id & " has no certification slot"
+    declared.add id
     doAssert entry["type"].getStr() == "player"
     doAssert entry["run"][0].getStr() == "/bin/daycare-player"
     doAssert entry.hasKey("resources")
     doAssert entry["description"].getStr().len > 0
-  # Two entries, not three: every declared player must occupy one of the TWO
-  # slots this game has, so a third runnable makes the fixture unsatisfiable.
-  doAssert manifest["player"].len == manifest["certification"]["players"].len
+  var seated: seq[string]
+  for slot in manifest["certification"]["players"]:
+    let id = slot["player_id"].getStr()
+    seated.add id
+    doAssert id in declared, id & " is not declared in manifest.player"
+  doAssert seated == @["daycare-caretaker", "daycare-stubborn"],
+    "offline certification must seat the explicit scripted baselines: " & $seated
 
 echo "test_manifest: the replay ships as a STATIC bundle, never a pod"
 block:

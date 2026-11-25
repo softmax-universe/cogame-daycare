@@ -208,12 +208,12 @@ block:
   doAssert scriptedOrders.len == 2
   doAssert scriptedOrders[0].source == osScripted
   doAssert scriptedOrders[1].source == osScripted
-  var raised = false
+  var raisedInfra = false
   try:
     discard client.decideAll(sim, @[0, 1], @["", ""], @[skNone, skNone], PromptSelection())
-  except DaycareError:
-    raised = true
-  doAssert raised, "prompt seats must fail instead of falling back to caretaker"
+  except LlmInfraError:
+    raisedInfra = true
+  doAssert raisedInfra, "prompt seats without credentials must raise LlmInfraError"
 
 # ---------------------------------------------------------------------------
 # the stubbed transport
@@ -380,13 +380,19 @@ block:
     sim.turn = 1
     let client = newLlmClient(cfg)
     doAssert not client.disabled
-    var raised = false
+    var raisedInfra = false
+    var raisedInvalid = false
     try:
       discard client.decideAll(sim, @[0, 1],
         @["be legible", "be legible"], @[skNone, skNone], PromptSelection())
-    except DaycareError:
-      raised = true
-    doAssert raised, &"{mode} must raise DaycareError instead of falling back"
+    except LlmInfraError:
+      raisedInfra = true
+    except InvalidActionError:
+      raisedInvalid = true
+    if mode == smJunk:
+      doAssert raisedInvalid, &"{mode} must raise InvalidActionError"
+    else:
+      doAssert raisedInfra, &"{mode} must raise LlmInfraError"
     if mode == smForbidden:
       doAssert client.disabled,
         "a 403 must disable the client for the rest of the episode"

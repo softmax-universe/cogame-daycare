@@ -6,8 +6,10 @@
 ## Forked from `cogame-bullwhip/src/bullwhip/llm.nim`. Decisions within a turn
 ## are SIMULTANEOUS by rule, so both seats' requests go out as ONE parallel
 ## batch (`curly.makeRequests`); an invalid reply is retried once as a smaller
-## batch with a hint, and anything still failing raises `DaycareError` so the
-## server forfeits the episode instead of silently substituting a scripted move.
+## batch with a hint, and anything still failing raises `LlmInfraError` or
+## `InvalidActionError` so the server terminates the unfinished episode unscored
+## with diagnostics instead of silently substituting a scripted move or
+## inventing a forfeit score.
 ##
 ## Measured caveat on that parallelism: curly sets CURLPIPE_MULTIPLEX, so on the
 ## FIRST batch — with no warm connection to the endpoint — libcurl holds the
@@ -354,32 +356,32 @@ proc extractJsonObject*(text: string): JsonNode =
   ## unrelated prose, extra objects, and non-object JSON.
   let trimmed = text.strip()
   if trimmed.len == 0:
-    raise newException(DaycareError, "empty response")
+    raise newException(InvalidActionError, "empty response")
   var candidate = trimmed
   if trimmed.startsWith("```"):
     let firstNl = trimmed.find('\n')
     if firstNl < 0:
-      raise newException(DaycareError, "unterminated markdown code fence")
+      raise newException(InvalidActionError, "unterminated markdown code fence")
     let tag = trimmed[3 ..< firstNl].strip().toLowerAscii()
     if tag.len > 0 and tag != "json":
-      raise newException(DaycareError, "unsupported markdown fence tag: " & tag)
+      raise newException(InvalidActionError, "unsupported markdown fence tag: " & tag)
     if not trimmed.endsWith("\n```") or firstNl + 1 >= trimmed.len - 3:
-      raise newException(DaycareError,
+      raise newException(InvalidActionError,
         "unterminated markdown code fence or trailing text")
     candidate = trimmed[firstNl + 1 ..< trimmed.len - 4].strip()
   if candidate.len == 0 or candidate[0] != '{' or candidate[^1] != '}':
     var head = trimmed
     if head.runeLen > 160:
       head = head.runeSubStr(0, 160) & "..."
-    raise newException(DaycareError,
+    raise newException(InvalidActionError,
       "reply must be a single JSON object (bare or in one markdown code fence): " &
       head.replace("\n", " "))
   try:
     result = parseJson(candidate)
   except CatchableError as error:
-    raise newException(DaycareError, "invalid JSON object: " & error.msg)
+    raise newException(InvalidActionError, "invalid JSON object: " & error.msg)
   if result.kind != JObject:
-    raise newException(DaycareError, "reply JSON must be an object")
+    raise newException(InvalidActionError, "reply JSON must be an object")
 
 proc requestFor(client: LlmClient, system, user: string, slot: int):
     tuple[url: string, headers: HttpHeaders, body: string] =
@@ -415,32 +417,37 @@ proc requestFor(client: LlmClient, system, user: string, slot: int):
 
 proc textOf(client: LlmClient, response: Response, error, url: string): string =
   if error.len > 0:
-    raise newException(DaycareError, "llm transport: " & error)
+    raise newException(LlmInfraError, "llm transport: " & error)
   if response.code == 401 or response.code == 403:
     let detail = response.body[0 .. min(response.body.high, 400)]
     if "Model access is denied" in response.body and
         client.tryNextBedrockModel("no model access"):
-      raise newException(DaycareError, "bedrock model access denied: " & detail)
-    ## 401/403 disables the client for the rest of the episode: both seats play
-    ## scripted from then on.
+      raise newException(LlmInfraError, "bedrock model access denied: " & detail)
     client.disabled = true
-    raise newException(DaycareError,
+    raise newException(LlmInfraError,
       "llm auth failed (" & $response.code & ") at " & url & ": " & detail)
   if response.code == 429:
     let detail = response.body[0 .. min(response.body.high, 300)]
     discard client.tryNextBedrockModel("throttled")
-    raise newException(DaycareError, "llm throttled (429): " & detail)
+    raise newException(LlmInfraError, "llm throttled (429): " & detail)
   if response.code < 200 or response.code >= 300:
-    raise newException(DaycareError, "anthropic error " & $response.code &
+    raise newException(LlmInfraError, "anthropic error " & $response.code &
       ": " & response.body[0 .. min(response.body.high, 300)])
-  let payload = parseJson(response.body)
+  var payload: JsonNode
+  try:
+    payload = parseJson(response.body)
+  except CatchableError as parseErr:
+    raise newException(LlmInfraError, "malformed provider JSON response: " & parseErr.msg)
+  if payload.kind != JObject or not payload.hasKey("content") or
+      payload["content"].kind != JArray:
+    raise newException(LlmInfraError, "provider response missing content array")
   if payload{"stop_reason"}.getStr() == "refusal":
-    raise newException(DaycareError, "anthropic refusal")
+    raise newException(InvalidActionError, "anthropic refusal")
   for contentBlock in payload["content"]:
     if contentBlock{"type"}.getStr() == "text":
       result.add contentBlock{"text"}.getStr()
   if payload{"stop_reason"}.getStr() == "max_tokens" and '{' notin result:
-    raise newException(DaycareError, "reply cut off at max_tokens before any " &
+    raise newException(InvalidActionError, "reply cut off at max_tokens before any " &
       "JSON: " & result[0 .. min(result.high, 160)].replace("\n", " "))
 
 # ---- reply parsing ----------------------------------------------------------
@@ -564,10 +571,11 @@ proc decideAll*(
       result[index] = scriptedOrder(sim, seat, kind)
     else:
       if client.disabled:
-        raise newException(DaycareError,
+        raise newException(LlmInfraError,
           "seat " & $seat & " requires an LLM decision but LLM client is disabled")
       open.add index
   var lastErrors = newSeq[string](seats.len)
+  var lastIsInfra = newSeq[bool](seats.len)
   for attempt in 0 .. 1:
     if open.len == 0 or client.disabled:
       break
@@ -606,9 +614,17 @@ proc decideAll*(
         order.source = if attempt == 0: osLlm else: osRetry
         order.latencyMs = latencyMs
         result[index] = order
+      except LlmInfraError as error:
+        if client.capture != nil: client.captured[seat].rejectedAttempt(error.msg)
+        lastErrors[index] = cleanText(error.msg, MaxErrorTextLen)
+        lastIsInfra[index] = true
+        echo "daycare llm: seat ", seat, " attempt ", attempt, " infra error: ",
+          lastErrors[index]
+        stillOpen.add index
       except CatchableError as error:
         if client.capture != nil: client.captured[seat].rejectedAttempt(error.msg)
         lastErrors[index] = cleanText(error.msg, MaxErrorTextLen)
+        lastIsInfra[index] = false
         echo "daycare llm: seat ", seat, " attempt ", attempt, " failed: ",
           lastErrors[index]
         stillOpen.add index
@@ -618,5 +634,8 @@ proc decideAll*(
     let seat = seats[index]
     let detail = if lastErrors[index].len > 0: lastErrors[index]
       else: "no valid LLM order"
-    raise newException(DaycareError,
+    if lastIsInfra[index]:
+      raise newException(LlmInfraError,
+        "seat " & $seat & " LLM infrastructure failure: " & detail)
+    raise newException(InvalidActionError,
       "seat " & $seat & " failed to produce a valid order: " & detail)
