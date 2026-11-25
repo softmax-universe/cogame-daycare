@@ -104,6 +104,8 @@ const
 
 type
   DaycareError* = object of CatchableError
+  LlmInfraError* = object of DaycareError
+  InvalidActionError* = object of DaycareError
 
   Fruit* = enum
     fApple = "apple"
@@ -144,7 +146,6 @@ type
     osScripted = "scripted"
     osLlm = "llm"
     osRetry = "retry"
-    osFallback = "fallback"
     osExternal = "external"
 
   Order* = object
@@ -291,9 +292,9 @@ proc otherFruit*(f: Fruit): Fruit =
   if f == fApple: fBanana else: fApple
 
 proc parseFruit*(text: string): Fruit =
-  case text.strip().toLowerAscii()
-  of "apple", "apples": fApple
-  of "banana", "bananas": fBanana
+  case text
+  of "apple": fApple
+  of "banana": fBanana
   else: raise newException(DaycareError, "unknown fruit: " & text)
 
 proc parseRole*(text: string): Role =

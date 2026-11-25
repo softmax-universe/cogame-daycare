@@ -1,11 +1,12 @@
 ## The decision layer.
 ##
-## Design note ## Tests, item 6. Reply parsing (fenced, prose-prefixed,
-## role-crossed, missing fields, hypothesis-testing guesses), and a STUBBED
-## TRANSPORT that times out, 429s, 403s or returns junk -- driven through the
-## real `curly.makeRequests` path by pointing the Bedrock sidecar endpoint at a
-## local mummy server, so the batching, the retry and the fallback are the
-## shipped code and not a mock of it.
+## Design note ## Tests, item 6. Strict reply parsing (bare or single outer
+## Markdown code fence, no surrounding prose, no extra objects, no legacy
+## aliases or unknown fields, role-crossed, missing fields, hypothesis-testing
+## guesses), and a STUBBED TRANSPORT that times out, 429s, 403s or returns
+## junk -- driven through the real `curly.makeRequests` path by pointing the
+## Bedrock sidecar endpoint at a local mummy server, so the batching, the retry
+## and the rejection/failure path are the shipped code and not a mock of it.
 
 import std/[atomics, json, os, strformat, strutils, times, unicode]
 import mummy, mummy/routers
@@ -16,22 +17,36 @@ import daycare/[llm, prompts]
 # reply parsing
 # ---------------------------------------------------------------------------
 
-echo "test_llm: extractJsonObject tolerates fences and prose"
+echo "test_llm: extractJsonObject accepts bare or single outer fence, rejects prose and extra objects"
 block:
-  let fenced = "```json\n{\"job\":\"provide\",\"fruit\":\"apple\"," &
+  let bare = "  {\"job\":\"idle\"}  "
+  doAssert extractJsonObject(bare){"job"}.getStr() == "idle"
+  let fencedJson = "```json\n{\"job\":\"provide\",\"fruit\":\"apple\"," &
     "\"guess\":\"apple\"}\n```"
-  doAssert extractJsonObject(fenced){"job"}.getStr() == "provide"
-  let prose = "Sure! Here is my order for this turn:\n" &
-    "{\"job\":\"show\",\"fruit\":\"banana\"}\nLet me know if you want more."
-  doAssert extractJsonObject(prose){"job"}.getStr() == "show"
-  let trailing = "{\"job\":\"idle\"} — I will just watch."
-  doAssert extractJsonObject(trailing){"job"}.getStr() == "idle"
-  var raised = false
-  try:
-    discard extractJsonObject("I am afraid I cannot help with that.")
-  except DaycareError:
-    raised = true
-  doAssert raised, "prose with no object parsed"
+  doAssert extractJsonObject(fencedJson){"job"}.getStr() == "provide"
+  let fencedPlain = "```\n{\"job\":\"show\",\"fruit\":\"banana\"}\n```"
+  doAssert extractJsonObject(fencedPlain){"job"}.getStr() == "show"
+  let fencedCrlf = "```JSON\r\n{\"job\":\"graze\"}\r\n```"
+  doAssert extractJsonObject(fencedCrlf){"job"}.getStr() == "graze"
+  for bad in [
+    "",
+    "I am afraid I cannot help with that.",
+    "Sure! Here is my order for this turn:\n{\"job\":\"show\",\"fruit\":\"banana\"}\nLet me know if you want more.",
+    "{\"job\":\"idle\"} — I will just watch.",
+    "Here is the JSON:\n```json\n{\"job\":\"idle\"}\n```",
+    "```json\n{\"job\":\"idle\"}\n```\nDone.",
+    "{\"job\":\"idle\"}\n{\"job\":\"graze\"}",
+    "```json\n{\"job\":\"idle\"}\n```\n```json\n{\"job\":\"graze\"}\n```",
+    "```python\n{\"job\":\"idle\"}\n```",
+    "```json\n```",
+    "[\"idle\"]",
+  ]:
+    var raised = false
+    try:
+      discard extractJsonObject(bad)
+    except DaycareError:
+      raised = true
+    doAssert raised, "invalid reply was accepted: " & bad
 
 echo "test_llm: a parent reply carrying a CHILD-only job is invalid"
 block:
@@ -113,12 +128,57 @@ block:
     %*{"job": "show", "fruit": "banana", "hunch": "line one\nline two"})
   doAssert "\n" notin multi.hunch
 
-echo "test_llm: extra keys are ignored"
+echo "test_llm: unknown keys, legacy aliases, case-folding and wrong types are rejected"
 block:
-  let order = parseOrder(rParent, parseJson(
-    "{\"job\":\"stock\",\"fruit\":\"banana\",\"guess\":\"banana\"," &
-    "\"confidence\":0.9,\"plan\":[1,2,3]}"))
-  doAssert order.pjob == pjStock
+  for bad in [
+    "{\"job\":\"stock\",\"fruit\":\"banana\",\"guess\":\"banana\",\"confidence\":0.9}",
+    "{\"job\":\"PROVIDE\",\"fruit\":\"apple\",\"guess\":\"apple\"}",
+    "{\"job\":\"provide\",\"fruit\":\"apples\",\"guess\":\"apple\"}",
+    "{\"job\":\"provide\",\"fruit\":\"apple\",\"guess\":\"bananas\"}",
+    "{\"job\":\"provide\",\"fruit\":\" apple \",\"guess\":\"apple\"}",
+    "{\"job\":\"provide\",\"fruit\":\"apple\",\"guess\":\"apple\",\"hunch\":123}",
+    "{\"job\":\"provide\",\"fruit\":\"apple\",\"guess\":\"apple\",\"notes\":[]}",
+    "{\"job\":\"watch\",\"fruit\":\"\",\"guess\":\"apple\"}",
+  ]:
+    var raised = false
+    try:
+      discard parseOrder(rParent, parseJson(bad))
+    except DaycareError:
+      raised = true
+    doAssert raised, "invalid parent order was accepted: " & bad
+  for bad in [
+    "{\"job\":\"SHOW\",\"fruit\":\"banana\"}",
+    "{\"job\":\"show\",\"fruit\":\"bananas\"}",
+    "{\"job\":\"graze\",\"guess\":\"apple\"}",
+    "{\"job\":\"graze\",\"extra\":true}",
+  ]:
+    var raised = false
+    try:
+      discard parseOrder(rChild, parseJson(bad))
+    except DaycareError:
+      raised = true
+    doAssert raised, "invalid child order was accepted: " & bad
+  # Genuine valid optional/null defaults are preserved.
+  let parentNulls = parseOrder(rParent, parseJson(
+    "{\"job\":\"watch\",\"fruit\":null,\"guess\":\"banana\",\"hunch\":null,\"notes\":null}"))
+  doAssert parentNulls.pjob == pjWatch and not parentNulls.hasFruit and
+    parentNulls.guess == fBanana and parentNulls.hunch == "" and parentNulls.notes == ""
+  let childNulls = parseOrder(rChild, parseJson(
+    "{\"job\":\"graze\",\"fruit\":null,\"guess\":null}"))
+  doAssert childNulls.cjob == cjGraze and not childNulls.hasFruit and not childNulls.hasGuess
+
+echo "test_llm: parseScriptKind rejects legacy aliases"
+block:
+  doAssert parseScriptKind("") == skNone
+  doAssert parseScriptKind("caretaker") == skCaretaker
+  doAssert parseScriptKind("stubborn") == skStubborn
+  for legacy in ["1", "true", "yes", "care", "foil", "CARETAKER", "unknown"]:
+    var raised = false
+    try:
+      discard parseScriptKind(legacy)
+    except DaycareError:
+      raised = true
+    doAssert raised, "legacy scripted alias was accepted: " & legacy
 
 echo "test_llm: minTurnSeconds floors the spacing between batch starts"
 block:
@@ -133,23 +193,27 @@ block:
   cfg.minTurnSeconds = 0
   doAssert paceDelayMs(cfg, 0.0) == 0
 
-echo "test_llm: with no credentials the client disables itself and both " &
-  "seats play the caretaker order"
+echo "test_llm: with no credentials genuine scripted seats work and prompt seats fail"
 block:
-  for key in ["AWS_ENDPOINT_URL_BEDROCK_RUNTIME", "AWS_BEARER_TOKEN_BEDROCK",
-      "ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY_URI"]:
+  for key in ["COWORLD_LLM_ENDPOINT", "AWS_ENDPOINT_URL_BEDROCK_RUNTIME",
+      "AWS_BEARER_TOKEN_BEDROCK", "ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY_URI"]:
     delEnv(key)
   let cfg = variantConfig("daycare", 3)
   var sim = initSim(cfg)
   sim.turn = 1
   let client = newLlmClient(cfg)
   doAssert client.disabled
-  let orders = client.decideAll(sim, @[0, 1], @["", ""], @[skNone, skNone], PromptSelection())
-  doAssert orders.len == 2
-  for seat in 0 .. 1:
-    var hedge = 0
-    doAssert orders[seat] == orderFor(sim, seat, prCareCare, hedge),
-      "seat " & $seat & " did not fall back to the caretaker order"
+  let scriptedOrders = client.decideAll(sim, @[0, 1], @["", ""],
+    @[skCaretaker, skStubborn], PromptSelection())
+  doAssert scriptedOrders.len == 2
+  doAssert scriptedOrders[0].source == osScripted
+  doAssert scriptedOrders[1].source == osScripted
+  var raisedInfra = false
+  try:
+    discard client.decideAll(sim, @[0, 1], @["", ""], @[skNone, skNone], PromptSelection())
+  except LlmInfraError:
+    raisedInfra = true
+  doAssert raisedInfra, "prompt seats without credentials must raise LlmInfraError"
 
 # ---------------------------------------------------------------------------
 # the stubbed transport
@@ -302,34 +366,39 @@ block:
     "requests: the seats were queried SEQUENTIALLY, which doubles the wall " &
     "clock against the 720 s play budget"
 
-echo "test_llm: junk, 429, 403 and a timeout all fall back to the caretaker " &
-  "order, never raise, and are recorded as source=fallback"
+echo "test_llm: junk, 429, 403 and a timeout all raise DaycareError instead of " &
+  "silently falling back to caretaker"
 block:
   for mode in [smJunk, smThrottled, smForbidden, smSlow]:
-    let run = stubbedRun(mode, llmTimeout = 1)
-    doAssert run.orders.len == 2, $mode
+    stubMode.store(ord(mode))
+    stubHits.store(0)
+    stubPeak.store(0)
+    stubConcurrent.store(0)
     var cfg = variantConfig("daycare", 5)
+    cfg.llmTimeoutSeconds = 1
     var sim = initSim(cfg)
     sim.turn = 1
-    for seat in 0 .. 1:
-      var hedge = 0
-      var expected = orderFor(sim, seat, prCareCare, hedge)
-      expected.source = osFallback
-      doAssert run.orders[seat].source == osFallback,
-        &"{mode} seat {seat} source is {run.orders[seat].source}"
-      doAssert run.orders[seat].pjob == expected.pjob and
-        run.orders[seat].cjob == expected.cjob and
-        run.orders[seat].fruit == expected.fruit and
-        run.orders[seat].guess == expected.guess,
-        &"{mode} seat {seat} is not the caretaker order"
-      # And the fallback order is legal for its role, so the episode advances.
-      sim.validateOrder(seat, run.orders[seat])
+    let client = newLlmClient(cfg)
+    doAssert not client.disabled
+    var raisedInfra = false
+    var raisedInvalid = false
+    try:
+      discard client.decideAll(sim, @[0, 1],
+        @["be legible", "be legible"], @[skNone, skNone], PromptSelection())
+    except LlmInfraError:
+      raisedInfra = true
+    except InvalidActionError:
+      raisedInvalid = true
+    if mode == smJunk:
+      doAssert raisedInvalid, &"{mode} must raise InvalidActionError"
+    else:
+      doAssert raisedInfra, &"{mode} must raise LlmInfraError"
     if mode == smForbidden:
-      doAssert run.disabled,
+      doAssert client.disabled,
         "a 403 must disable the client for the rest of the episode"
     if mode in {smJunk, smThrottled}:
-      doAssert run.hits == 4,
-        &"{mode}: {run.hits} requests — an invalid reply is retried ONCE, " &
+      doAssert stubHits.load() == 4,
+        &"{mode}: {stubHits.load()} requests — an invalid reply is retried ONCE, " &
         "as one smaller batch"
 
 echo "test_llm: an invalid first reply is retried once WITH THE HINT and the " &

@@ -93,12 +93,15 @@ existing spectator replay remains a post-episode record and includes secret and 
 observation or a model completion.
 
 The native parser also checks consumed `hunch` and `notes` strings for Unicode scalar UTF-8 before cleaning them.
-Invalid consumed text follows the existing retry and caretaker fallback path. Direct native order application performs
-this preflight before cleaning or changing state. Ignored outer JSON fields remain ignored by gameplay. This validation
-is independent of capture.
+Invalid consumed text, unknown fields, legacy aliases, surrounding prose, and extra JSON objects are rejected and follow
+the retry-then-fail path (unscored episode termination with diagnostics; no silent `caretaker` fallback and no invented
+forfeit score). Direct native order application performs this preflight before cleaning or changing state. This
+validation is independent of capture.
 
 Selection requires a completed joined 2xx response, no prior rejection, strict JSON grammar and decoded-key uniqueness,
-scalar UTF-8, and unchanged types and values for every supplied field compared with the installed action. Native fences
+scalar UTF-8, exact unmodified game-action fields (`job`, `fruit`, `guess`), and documented normalization/clipping only
+for ancillary display/memory fields (`hunch` at 80 runes, `notes` at 240 runes) or optional `null`/omitted defaults.
+Raw response text is preserved verbatim alongside the applied action. Native fences
 and omitted defaults remain eligible. Native case folding, trimming, clamping, truncated strings, ignored fields and
 permissive numeric/JSON forms continue to work in the game but are rejected as targets. Original responses are never
 rewritten into canonical labels. Scripted/external actions without a native model attempt remain unselected; actual

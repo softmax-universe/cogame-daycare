@@ -1,11 +1,9 @@
 ## The two role-aware scripted baselines. Both are fieldable policies and both
-## are league fillers; `caretaker` is also the fallback every failed LLM
-## decision lands on.
+## are league fillers.
 ##
 ## One baseline plays EITHER seat, deciding purely from its own observation at
 ## each turn boundary — no shared state between the seats.
 
-import std/[strutils]
 import sim_types, yard, sim_state, sim
 
 type
@@ -15,12 +13,13 @@ type
     skStubborn = "stubborn"
 
 proc parseScriptKind*(text: string): ScriptKind =
-  ## PLAYER_SCRIPTED values: "1"/"true"/"yes"/"caretaker" play the working
-  ## baseline, "stubborn" the anti-theory-of-mind foil, anything else nothing.
-  case text.strip().toLowerAscii()
-  of "1", "true", "yes", "caretaker", "care": skCaretaker
-  of "stubborn", "foil": skStubborn
-  else: skNone
+  ## PLAYER_SCRIPTED values: "" (unset), "caretaker", or "stubborn".
+  case text
+  of "": skNone
+  of "caretaker": skCaretaker
+  of "stubborn": skStubborn
+  else: raise newException(DaycareError,
+    "unknown scripted baseline (expected caretaker or stubborn): " & text)
 
 proc readWeight*(c: SpeciesCounters, f: Fruit): int =
   ## w(f) = 3*reachFails[f] + 2*groundPasses[other(f)] + adjacentTicks[f]
@@ -146,12 +145,15 @@ proc stubbornChild(sim: Sim): Order =
 proc scriptedOrder*(sim: Sim, seat: int, kind: ScriptKind): Order =
   ## Always legal, for this seat's ROLE, by construction —
   ## `tests/test_baseline.nim` asserts it over 12 seeds x 4 variants.
-  let effective = if kind == skNone: skCaretaker else: kind
+  if kind == skNone:
+    raise newException(DaycareError, "scriptedOrder requires a scripted baseline")
   if sim.roleOf[seat] == rParent:
-    case effective
+    case kind
     of skStubborn: stubbornParent(sim)
-    else: caretakerParent(sim)
+    of skCaretaker: caretakerParent(sim)
+    of skNone: raise newException(DaycareError, "unreachable")
   else:
-    case effective
+    case kind
     of skStubborn: stubbornChild(sim)
-    else: caretakerChild(sim)
+    of skCaretaker: caretakerChild(sim)
+    of skNone: raise newException(DaycareError, "unreachable")

@@ -3,7 +3,7 @@
 ## Forked from `cogame-bullwhip/src/bullwhip_player.nim`. Connects to the game,
 ## Prompt policies deliver PLAYER_PROMPT to the game's Claude adapter.
 ##
-## PLAYER_SCRIPTED=caretaker (or 1) registers the seat as the built-in working
+## PLAYER_SCRIPTED=caretaker registers the seat as the built-in working
 ## baseline instead; PLAYER_SCRIPTED=stubborn as the anti-theory-of-mind foil.
 ## The server plays those deterministically, no LLM.
 ##
@@ -37,6 +37,8 @@ when isMainModule:
   if prompt.len == 0:
     prompt = DefaultPrompt
   let scripted = getEnv("PLAYER_SCRIPTED").strip()
+  if scripted notin ["", "caretaker", "stubborn"]:
+    quit("PLAYER_SCRIPTED must be empty, caretaker, or stubborn: " & scripted, 1)
 
   proc promptFrame(): string =
     $ %*{"type": "prompt", "prompt": prompt, "scripted": scripted}
@@ -73,7 +75,11 @@ when isMainModule:
           ## raced the server's slot registration.
           socket.send(promptFrame())
         of "final":
-          echo "daycare player: final scores ", payload{"scores"}
+          if payload{"failed"}.getBool():
+            echo "daycare player: episode failed (",
+              payload{"cause"}.getStr(), "): ", payload{"error"}.getStr()
+          else:
+            echo "daycare player: final scores ", payload{"scores"}
           break
         else:
           discard

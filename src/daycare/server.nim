@@ -223,6 +223,67 @@ proc finishEpisode(runtimeConfig: RuntimeConfig) =
   echo "daycare: shutting down"
   quit(0)
 
+proc failEpisode(runtimeConfig: RuntimeConfig, capture: RuntimeCapture,
+    captured: seq[CapturedDecision], cause, detail: string,
+    seat = -1, turn = 0) =
+  ## Terminates an unfinished episode unscored with failure diagnostics: writes
+  ## COGAME_PLAYER_FAILURE_URI and COGAME_LOG_URI (when configured), preserves
+  ## any private capture attempts with esFailed and null scores, notifies
+  ## connected players so they exit cleanly, and exits non-zero WITHOUT writing
+  ## results.json or replay.json (no invented winner, forfeit score, or payoff).
+  var failurePayload: JsonNode
+  withLock stateLock:
+    if state.finished:
+      return
+    state.finished = true
+    failurePayload = %*{
+      "status": "failed",
+      "cause": cause,
+      "detail": cleanText(detail, MaxErrorTextLen),
+      "seat": seat,
+      "turn": turn,
+      "turns_completed": state.sim.turnsPlayed,
+      "game": "daycare",
+      "variant": state.sim.variant
+    }
+    var final = %*{
+      "type": "final",
+      "done": true,
+      "failed": true,
+      "cause": cause,
+      "error": cleanText(detail, MaxErrorTextLen),
+      "turn": turn
+    }
+    for slot, socket in state.playerSockets:
+      final["slot"] = %slot
+      try:
+        socket.send($final)
+      except CatchableError:
+        discard
+
+  sleep(200)
+  echo "daycare: episode failed unscored (cause=", cause, ", seat=", seat,
+    ", turn=", turn, "): ", detail
+  let failureUri = getEnv("COGAME_PLAYER_FAILURE_URI").strip()
+  if failureUri.len > 0:
+    try:
+      writeArtifact(failureUri, $failurePayload, "application/json",
+        "COGAME_PLAYER_FAILURE_METHOD")
+    except CatchableError as error:
+      echo "daycare: failed writing COGAME_PLAYER_FAILURE_URI: ", error.msg
+  if runtimeConfig.logUri.len > 0:
+    try:
+      writeArtifact(runtimeConfig.logUri, $failurePayload & "\n",
+        "application/json", "COGAME_LOG_METHOD")
+    except CatchableError as error:
+      echo "daycare: failed writing COGAME_LOG_URI: ", error.msg
+  if capture != nil:
+    for slot in 0 .. 1:
+      if slot < captured.len and captured[slot] != nil:
+        capture.recordFailedDecision(captured[slot], slot, cause, detail)
+    capture.finishFailedCapture(failurePayload)
+  quit(1)
+
 # ---------------------------------------------------------------------------
 # the turn loop
 # ---------------------------------------------------------------------------
@@ -244,8 +305,7 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
 
     ## Both sockets are up; give the prompt frames a bounded moment to land.
     ## The player sends its prompt on connect AND again after `welcome`, so a
-    ## seat whose prompt has not arrived yet would silently play `caretaker` for
-    ## turn 1. Bounded, so a seat that never sends one costs at most this.
+    ## seat whose prompt has not arrived yet is waited on briefly.
     let promptDeadline = epochTime() + 2.0
     while epochTime() < promptDeadline:
       var pending = false
@@ -259,25 +319,48 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
       sleep(50)
 
     var connected = 0
+    var unregisteredSlot = -1
+    var missingSlot = -1
     withLock stateLock:
       state.started = true
       connected = state.playerSockets.len
+      for slot in 0 .. 1:
+        if not state.playerSockets.hasKey(slot):
+          if missingSlot < 0: missingSlot = slot
+        elif not state.registered[slot]:
+          if unregisteredSlot < 0: unregisteredSlot = slot
       echo "daycare: starting with ", connected, "/2 players connected"
       state.broadcastLocked()
 
+    let capture = newRuntimeCapture(config, runtimeConfig.resultsUri, runtimeConfig.replayUri)
+
     if connected == 0:
-      ## No seat present at all -> forfeit. A MISSING seat does not end the
-      ## episode: it plays `caretaker` and the game runs.
+      ## Pre-existing rule (origin/main src/daycare/server.nim:269-278 &
+      ## src/daycare/sim.nim:406-411): when zero seats connect within
+      ## playerConnectTimeoutSeconds, settle as forfeit.
       echo "daycare: no player connected within ",
         config.playerConnectTimeoutSeconds, "s; forfeit"
       withLock stateLock:
         state.sim.forfeit()
         state.broadcastLocked()
+      if capture != nil:
+        withLock stateLock: capture.finishCapture(state.sim.resultsJson())
       finishEpisode(runtimeConfig)
       return
 
+    if connected < 2:
+      failEpisode(runtimeConfig, capture, @[], "player_error",
+        "only " & $connected & "/2 players connected within " &
+        $config.playerConnectTimeoutSeconds & "s", seat = missingSlot)
+      return
+
+    if unregisteredSlot >= 0:
+      failEpisode(runtimeConfig, capture, @[], "player_error",
+        "seat " & $unregisteredSlot & " failed to register within 2s",
+        seat = unregisteredSlot)
+      return
+
     let client = newLlmClient(config)
-    let capture = newRuntimeCapture(config, runtimeConfig.resultsUri, runtimeConfig.replayUri)
     client.capture = capture
 
     ## The game container is NOT given COWORLD_TIMEOUT_SECONDS (only the worker
@@ -302,6 +385,8 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
       var prompts: seq[string]
       var scriptedKinds: seq[ScriptKind]
       var external: seq[bool]
+      var nativeSeats: seq[int]
+      var disconnectedSlot = -1
       withLock stateLock:
         if playDeadline > 0.0 and epochTime() > playDeadline:
           echo "daycare: episode deadline reached after ",
@@ -309,77 +394,135 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
           state.sim.endEarly()
           state.broadcastLocked()
           break
+        for slot in 0 .. 1:
+          if not state.playerSockets.hasKey(slot):
+            disconnectedSlot = slot
+            break
+        if disconnectedSlot >= 0:
+          break
         state.sim.turn = turn
         simCopy = state.sim
         prompts = state.prompts
         scriptedKinds = state.scripted
         external = state.external
         state.awaitingTurn = turn
-        ## A seat whose socket died mid-episode plays `caretaker` for every
-        ## remaining turn; the episode never blocks on a socket.
         for slot in 0 .. 1:
-          if not state.playerSockets.hasKey(slot) and
-              scriptedKinds[slot] == skNone:
-            scriptedKinds[slot] = skCaretaker
-          if external[slot] and state.playerSockets.hasKey(slot):
-            scriptedKinds[slot] = skCaretaker
+          if external[slot]:
             state.received[slot] = false
             state.playerSockets[slot].send($ %*{
               "type": "observation", "turn": turn,
               "observation": state.sim.playerStateJson(slot)})
           else:
-            external[slot] = false
+            nativeSeats.add slot
+
+      if disconnectedSlot >= 0:
+        failEpisode(runtimeConfig, capture, @[], "player_error",
+          "seat " & $disconnectedSlot & " disconnected",
+          seat = disconnectedSlot, turn = turn)
+        return
 
       let batchStart = epochTime()
-      var orders = client.decideAll(simCopy, @[0, 1], prompts, scriptedKinds, state.selection)
-      let actionDeadline = batchStart + config.llmTimeoutSeconds.float
-      while epochTime() < actionDeadline:
-        var waiting = false
-        withLock stateLock:
-          for slot in 0 .. 1:
-            if external[slot] and not state.received[slot]:
-              waiting = true
-        if not waiting:
-          break
-        sleep(20)
+      var orders: array[2, Order]
+      var turnFailed = false
+      var failureCause = ""
+      var failureDetail = ""
+      var failureSeat = -1
+      if nativeSeats.len > 0:
+        try:
+          let nativeOrders = client.decideAll(simCopy, nativeSeats, prompts,
+            scriptedKinds, state.selection)
+          for i, slot in nativeSeats:
+            orders[slot] = nativeOrders[i]
+        except LlmInfraError as error:
+          turnFailed = true
+          failureCause = "infra_error"
+          failureDetail = error.msg
+        except InvalidActionError as error:
+          turnFailed = true
+          failureCause = "invalid_action"
+          failureDetail = error.msg
+        except CatchableError as error:
+          turnFailed = true
+          failureCause = "invalid_action"
+          failureDetail = error.msg
+      if not turnFailed and (external[0] or external[1]):
+        let actionDeadline = batchStart + config.llmTimeoutSeconds.float
+        while epochTime() < actionDeadline:
+          var waiting = false
+          withLock stateLock:
+            for slot in 0 .. 1:
+              if external[slot]:
+                if not state.playerSockets.hasKey(slot):
+                  turnFailed = true
+                  failureCause = "player_error"
+                  failureSeat = slot
+                  failureDetail = "seat " & $slot & " disconnected"
+                  break
+                if not state.received[slot]:
+                  waiting = true
+          if turnFailed or not waiting:
+            break
+          sleep(20)
 
+      var failNow = false
       withLock stateLock:
         state.awaitingTurn = 0
-        for slot in 0 .. 1:
-          if external[slot]:
-            if state.received[slot]:
-              orders[slot] = state.pendingOrders[slot]
-            else:
-              orders[slot].source = osFallback
-        for slot in 0 .. 1:
-          var order = orders[slot]
-          try:
-            state.sim.applyOrder(slot, order)
-          except CatchableError as error:
-            echo "daycare: order rejected (", error.msg,
-              "); using the caretaker order"
-            var fallback = scriptedOrder(state.sim, slot, skCaretaker)
-            fallback.source = osFallback
-            state.sim.applyOrder(slot, fallback)
-          echo "daycare: turn ", turn, " ", state.sim.names[slot], " (",
-            state.sim.roleOf[slot], ") ", state.sim.jobName(slot),
-            (if order.hasFruit: " " & $order.fruit else: ""),
-            " source=", order.source,
-            " at ", (epochTime() - gameStart).int, "s"
-        if capture != nil:
+        if not turnFailed:
           for slot in 0 .. 1:
-            var ownEvent = newJNull()
-            for index in countdown(state.sim.events.high, 0):
-              let event = state.sim.events[index]
-              if event{"k"}.getStr() == "order" and event{"seat"}.getInt(-1) == slot and event{"turn"}.getInt() == turn:
-                ownEvent = copy(event)
+            if not state.playerSockets.hasKey(slot):
+              turnFailed = true
+              failureCause = "player_error"
+              failureSeat = slot
+              failureDetail = "seat " & $slot & " disconnected"
+              break
+            if external[slot]:
+              if state.received[slot]:
+                orders[slot] = state.pendingOrders[slot]
+              else:
+                turnFailed = true
+                failureCause = "invalid_action"
+                failureSeat = slot
+                failureDetail = "seat " & $slot & " failed to send a valid action in time"
                 break
-            let installed = state.sim.lastOrders[slot]
-            capture.applied(client.captured[slot], slot,
-              orderJson(state.sim.roleOf[slot], installed), ownEvent,
-              $installed.source, state.sim.nativeStateHash(slot))
-        state.sim.playTurn()
-        state.broadcastLocked()
+        if not turnFailed:
+          try:
+            for slot in 0 .. 1:
+              state.sim.validateOrder(slot, orders[slot])
+          except CatchableError as error:
+            turnFailed = true
+            failureCause = "invalid_action"
+            failureDetail = error.msg
+        if turnFailed:
+          failNow = true
+        else:
+          for slot in 0 .. 1:
+            let order = orders[slot]
+            state.sim.applyOrder(slot, order)
+            echo "daycare: turn ", turn, " ", state.sim.names[slot], " (",
+              state.sim.roleOf[slot], ") ", state.sim.jobName(slot),
+              (if order.hasFruit: " " & $order.fruit else: ""),
+              " source=", order.source,
+              " at ", (epochTime() - gameStart).int, "s"
+          if capture != nil:
+            for slot in 0 .. 1:
+              if slot < client.captured.len and client.captured[slot] != nil:
+                var ownEvent = newJNull()
+                for index in countdown(state.sim.events.high, 0):
+                  let event = state.sim.events[index]
+                  if event{"k"}.getStr() == "order" and event{"seat"}.getInt(-1) == slot and event{"turn"}.getInt() == turn:
+                    ownEvent = copy(event)
+                    break
+                let installed = state.sim.lastOrders[slot]
+                capture.applied(client.captured[slot], slot,
+                  orderJson(state.sim.roleOf[slot], installed), ownEvent,
+                  $installed.source, state.sim.nativeStateHash(slot))
+          state.sim.playTurn()
+          state.broadcastLocked()
+
+      if failNow:
+        failEpisode(runtimeConfig, capture, client.captured, failureCause,
+          failureDetail, seat = failureSeat, turn = turn)
+        return
 
       ## `minTurnSeconds` floors the spacing between batch STARTS, so the
       ## episode stays under the Bedrock sidecar's 30 requests/minute
@@ -539,14 +682,26 @@ proc websocketHandler(
             state.registered[slot] = true
           return
         if payload{"type"}.getStr() == "action":
-          withLock stateLock:
-            if state.external[slot] and state.awaitingTurn ==
-                payload["turn"].getInt() and not state.received[slot]:
-              var order = parseOrder(state.sim.roleOf[slot], payload["order"])
-              state.sim.validateOrder(slot, order)
-              order.source = osExternal
-              state.pendingOrders[slot] = order
-              state.received[slot] = true
+          let turnNode = payload{"turn"}
+          let turnNum =
+            if not turnNode.isNil and turnNode.kind == JInt: turnNode.getInt()
+            else: -1
+          try:
+            withLock stateLock:
+              if state.external[slot] and state.awaitingTurn == turnNum and
+                  not state.received[slot]:
+                var order = parseOrder(state.sim.roleOf[slot], payload{"order"})
+                state.sim.validateOrder(slot, order)
+                order.source = osExternal
+                state.pendingOrders[slot] = order
+                state.received[slot] = true
+          except CatchableError as error:
+            echo "daycare: rejecting bad action from slot ", slot, ": ", error.msg
+            websocket.send($ %*{
+              "type": "error",
+              "turn": turnNum,
+              "error": cleanText(error.msg, MaxErrorTextLen)
+            })
           return
         if payload{"type"}.getStr() != "prompt":
           echo "daycare: ignoring player frame of type ",
@@ -557,10 +712,9 @@ proc websocketHandler(
           prompt = prompt.runeSubStr(0, MaxPromptLen)
         let node = payload{"scripted"}
         let kind =
-          if node.isNil: skNone
-          elif node.kind == JBool:
-            (if node.getBool(): skCaretaker else: skNone)
-          else: parseScriptKind(node.getStr())
+          if node.isNil or node.kind == JNull: skNone
+          elif node.kind == JString: parseScriptKind(node.getStr())
+          else: raise newException(DaycareError, "scripted must be a string")
         withLock stateLock:
           state.prompts[slot] = prompt
           state.scripted[slot] = kind

@@ -230,13 +230,32 @@ proc parsedProposal*(capture: CapturedDecision, action: JsonNode) =
       "attempt_id": capture.attempts[^1].attemptId, "action": action})
   except CatchableError as error: capture.captureError(error.msg)
 
-proc strictRawObject(text: string): JsonNode =
-  ## Reused from Garble's reviewed native-capture strictRawObject; native gameplay decoder is unchanged.
+proc stripOuterCodeFence(text: string): string =
+  ## Strips outer whitespace and at most one ordinary outer Markdown code fence
+  ## (JSON-tagged or plain), rejecting surrounding prose or extra trailing text.
+  let trimmed = text.strip()
+  if trimmed.len == 0:
+    raise newException(ValueError, "empty raw JSON reply")
+  if trimmed.startsWith("```"):
+    let firstNl = trimmed.find('\n')
+    if firstNl < 0:
+      raise newException(ValueError, "unterminated markdown code fence")
+    let tag = trimmed[3 ..< firstNl].strip().toLowerAscii()
+    if tag.len > 0 and tag != "json":
+      raise newException(ValueError, "unsupported markdown fence tag: " & tag)
+    if not trimmed.endsWith("\n```") or firstNl + 1 >= trimmed.len - 3:
+      raise newException(ValueError, "unterminated markdown code fence or trailing text")
+    return trimmed[firstNl + 1 ..< trimmed.len - 4].strip()
+  trimmed
+
+proc strictRawObject*(text: string): JsonNode =
+  ## Strict RFC 8259 JSON object parser for bare JSON or a single ordinary outer
+  ## Markdown code fence. Rejects surrounding prose, duplicate keys, comments,
+  ## non-finite numbers, non-UTF8, and depth > 32.
   if not scalarUtf8(text): raise newException(ValueError, "raw JSON is not UTF-8")
-  let first = text.find('{')
-  let last = text.rfind('}')
-  if first < 0 or last < first: raise newException(ValueError, "no raw JSON object")
-  let source = text[first .. last]
+  let source = stripOuterCodeFence(text)
+  if source.len < 2 or source[0] != '{' or source[^1] != '}':
+    raise newException(ValueError, "raw reply must be a single JSON object")
   var quoted = false
   var index = 0
   while index < source.len:
@@ -340,22 +359,72 @@ proc strictRawObject(text: string): JsonNode =
   if parser.tok != tkEof or result.kind != JObject:
     raise newException(ValueError, "one raw JSON object required")
 
-proc equalSupplied(raw, actual: JsonNode): bool =
-  if raw.kind != actual.kind: return false
-  if raw.kind == JObject:
-    for key, value in raw:
-      if not actual.hasKey(key) or not equalSupplied(value, actual[key]): return false
-    return true
-  if raw.kind == JArray:
-    if raw.len != actual.len: return false
-    for index in 0 ..< raw.len:
-      if not equalSupplied(raw[index], actual[index]): return false
-    return true
-  raw == actual
+proc matchesAppliedOrder*(raw, actual: JsonNode):
+    tuple[ok, hunchClipped, notesClipped: bool] =
+  ## Verifies that all game-action fields (`job`, `fruit`, `guess`) in `raw`
+  ## match `actual` verbatim (never trimmed, case-folded, or repaired), while
+  ## allowing documented presentation/ancillary normalization for `hunch` (80
+  ## runes, single-line) and `notes` (240 runes) as well as explicit `null`
+  ## optional defaults.
+  if raw.isNil or actual.isNil or raw.kind != JObject or actual.kind != JObject:
+    return (false, false, false)
+  if not raw.hasKey("job") or raw["job"].kind != JString or
+      raw["job"] != actual{"job"}:
+    return (false, false, false)
+  var hunchClipped = false
+  var notesClipped = false
+  for key, value in raw:
+    case key
+    of "job":
+      discard # already checked verbatim above
+    of "fruit", "guess":
+      let appliedVal = actual{key}
+      if value.kind == JNull:
+        if appliedVal.isNil or appliedVal.kind != JNull:
+          return (false, false, false)
+      elif value.kind == JString:
+        if appliedVal.isNil or appliedVal != value:
+          return (false, false, false)
+      else:
+        return (false, false, false)
+    of "hunch":
+      let appliedVal = actual{"hunch"}
+      if appliedVal.isNil or appliedVal.kind != JString:
+        return (false, false, false)
+      if value.kind == JNull:
+        if appliedVal.getStr() != "":
+          return (false, false, false)
+      elif value.kind == JString:
+        let cleaned = cleanHunch(value.getStr())
+        if cleaned != appliedVal.getStr():
+          return (false, false, false)
+        hunchClipped = (cleaned != value.getStr())
+      else:
+        return (false, false, false)
+    of "notes":
+      let appliedVal = actual{"notes"}
+      if appliedVal.isNil or appliedVal.kind != JString:
+        return (false, false, false)
+      if value.kind == JNull:
+        if appliedVal.getStr() != "":
+          return (false, false, false)
+      elif value.kind == JString:
+        let cleaned = cleanNotes(value.getStr())
+        if cleaned != appliedVal.getStr():
+          return (false, false, false)
+        notesClipped = (cleaned != value.getStr())
+      else:
+        return (false, false, false)
+    else:
+      return (false, false, false)
+  (true, hunchClipped, notesClipped)
 
-proc unchangedReply(text: string, actual: JsonNode): bool =
-  try: equalSupplied(strictRawObject(text), actual)
-  except CatchableError: false
+proc unchangedReply*(text: string, actual: JsonNode):
+    tuple[ok, hunchClipped, notesClipped: bool] =
+  try:
+    matchesAppliedOrder(strictRawObject(text), actual)
+  except CatchableError:
+    (false, false, false)
 
 proc applied*(capture: RuntimeCapture, decision: CapturedDecision,
     seat: int, actual0, ownEvent: JsonNode, source, postHash: string) =
@@ -379,17 +448,22 @@ proc applied*(capture: RuntimeCapture, decision: CapturedDecision,
       if decision.attempts.len > 0:
         var evidence = addr decision.attempts[^1]
         evidence.parsedAction = copy(actual)
+        let check = unchangedReply(decision.generated[^1], actual)
         evidence.accepted = not decision.failed and evidence.rejectionReason.isNone and
           evidence.responseComplete == some(true) and evidence.responseReaderJoined == some(true) and
           evidence.httpStatus.isSome and evidence.httpStatus.get() in 200 .. 299 and
           evidence.rawResponse.kind == JString and evidence.responseBodyB64.isSome and
           evidence.responseHeaders.isSome and
-          unchangedReply(decision.generated[^1], actual)
+          check.ok
         if evidence.accepted:
           selected = some(evidence.attemptId)
           status = asAccepted
+          decision.observation["native_execution"]["ancillary_normalized"] = %*{
+            "hunch_clipped": check.hunchClipped,
+            "notes_clipped": check.notesClipped
+          }
         else:
-          evidence.rejectionReason = some("strict JSON grammar/depth or supplied field/type/value differs from applied action")
+          evidence.rejectionReason = some("strict JSON grammar/depth or supplied game-action field/type/value differs from applied action")
     var originalAttempts = newJArray()
     for evidence in decision.attempts: originalAttempts.add(attemptEvidenceJson(evidence))
     let original = %*{"observation": decision.observation, "attempts": originalAttempts,
@@ -423,6 +497,42 @@ proc applied*(capture: RuntimeCapture, decision: CapturedDecision,
         fallbackOrigin = (if fallback: some("caretaker") else: none(string)))
   except CatchableError as error:
     capture.captureError("applied evidence failed: " & error.msg)
+
+proc recordFailedDecision*(capture: RuntimeCapture, decision: CapturedDecision,
+    seat: int, cause, detail: string) =
+  ## Records an unfinished/failed decision's attempts and diagnostics without
+  ## inventing an executed action or score.
+  if capture == nil or decision == nil or capture.trajectory == nil: return
+  try:
+    decision.observation["native_execution"] = %*{
+      "failure_cause": safeDiagnostic(cause),
+      "failure_detail": safeDiagnostic(detail)
+    }
+    let status = if decision.attempts.len > 0: asRejected else: asMissing
+    capture.trajectory.recordDecision(decision.id, $seat, decision.observation,
+      decision.attempts, none(string), newJNull(), status)
+  except CatchableError as error:
+    capture.captureError("failed decision evidence error: " & error.msg)
+
+proc finishFailedCapture*(capture: RuntimeCapture, failureOutcome: JsonNode) =
+  ## Finishes private capture for a failed/unfinished episode with esFailed and
+  ## null participant_outcomes (never invented numeric scores).
+  if capture == nil: return
+  try:
+    if capture.trajectory == nil:
+      raise newException(ValueError, "trajectory initialization failed")
+    var privateOutcome = copy(failureOutcome)
+    if not scalarJson(privateOutcome):
+      capture.captureError("non-Unicode native failure outcome; original JSON bytes retained as base64")
+      privateOutcome = %*{"invalid_native_outcome_json_b64": encode($failureOutcome)}
+    if capture.failed:
+      privateOutcome["capture_errors"] = %capture.errors
+    capture.trajectory.finish(esFailed, privateOutcome, newJNull())
+    if capture.trajectory.eventsJsonl().len > MaxEpisodeEvidenceBytes:
+      raise newException(ValueError, "private episode exceeds 24 MiB; publication omitted, no truncation")
+    capture.trajectory.writeEventsToUri(getEnv(CogameSaveTrajectoryUriEnv))
+  except CatchableError as error:
+    echo "daycare: private capture publication failed: ", safeDiagnostic(error.msg)
 
 proc finishCapture*(capture: RuntimeCapture, outcome: JsonNode) =
   if capture == nil: return
