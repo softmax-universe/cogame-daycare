@@ -220,8 +220,8 @@ block:
 # ---------------------------------------------------------------------------
 
 type StubMode = enum
-  smJunk, smThrottled, smForbidden, smSlow, smValid, smValidThenInvalid,
-  smParallelProbe
+  smJunk, smThrottled, smForbidden, smUnavailable, smSlow, smValid,
+  smSeat1Junk, smSeat1Unavailable, smParallelProbe
 
 var stubMode: Atomic[int]
 var stubHits: Atomic[int]
@@ -256,6 +256,9 @@ proc stubHandler(request: Request) {.gcsafe.} =
   of smForbidden:
     sleep(60)
     request.respond(403, headers, """{"message":"forbidden"}""")
+  of smUnavailable:
+    sleep(60)
+    request.respond(503, headers, """{"message":"service unavailable"}""")
   of smSlow:
     sleep(2500)
     request.respond(200, headers, anthropicBody(ValidParentReply))
@@ -266,7 +269,7 @@ proc stubHandler(request: Request) {.gcsafe.} =
     let isParent = "THE CHILD'S PREFERENCE IS NEVER SHOWN TO YOU" in request.body
     request.respond(200, headers, anthropicBody(
       if isParent: ValidParentReply else: ValidChildReply))
-  of smValid, smValidThenInvalid:
+  of smValid:
     sleep(60)
     let body = request.body
     # The system prompt names the role, so the stub can answer per role exactly
@@ -275,10 +278,19 @@ proc stubHandler(request: Request) {.gcsafe.} =
       if "THE CHILD'S PREFERENCE IS NEVER SHOWN TO YOU" in body:
         ValidParentReply
       else: ValidChildReply
-    if mode == smValidThenInvalid and "previous reply was invalid" notin body:
-      request.respond(200, headers, anthropicBody("no json here"))
+    request.respond(200, headers, anthropicBody(reply))
+  of smSeat1Junk:
+    sleep(60)
+    if "THE CHILD'S PREFERENCE IS NEVER SHOWN TO YOU" in request.body:
+      request.respond(200, headers, anthropicBody(ValidParentReply))
     else:
-      request.respond(200, headers, anthropicBody(reply))
+      request.respond(200, headers, anthropicBody("not an action"))
+  of smSeat1Unavailable:
+    sleep(60)
+    if "THE CHILD'S PREFERENCE IS NEVER SHOWN TO YOU" in request.body:
+      request.respond(200, headers, anthropicBody(ValidParentReply))
+    else:
+      request.respond(503, headers, """{"message":"service unavailable"}""")
   discard stubConcurrent.fetchAdd(-1)
 
 var stubServer: Server
@@ -366,10 +378,10 @@ block:
     "requests: the seats were queried SEQUENTIALLY, which doubles the wall " &
     "clock against the 720 s play budget"
 
-echo "test_llm: junk, 429, 403 and a timeout all raise DaycareError instead of " &
-  "silently falling back to caretaker"
+echo "test_llm: junk, 429, 403, 503 and a timeout all fail immediately without " &
+  "retrying or falling back, attributed to the actual failing seat"
 block:
-  for mode in [smJunk, smThrottled, smForbidden, smSlow]:
+  for mode in [smJunk, smThrottled, smForbidden, smUnavailable, smSlow]:
     stubMode.store(ord(mode))
     stubHits.store(0)
     stubPeak.store(0)
@@ -382,33 +394,59 @@ block:
     doAssert not client.disabled
     var raisedInfra = false
     var raisedInvalid = false
+    var failedSeat = -1
     try:
       discard client.decideAll(sim, @[0, 1],
         @["be legible", "be legible"], @[skNone, skNone], PromptSelection())
-    except LlmInfraError:
+    except LlmInfraError as err:
       raisedInfra = true
-    except InvalidActionError:
+      failedSeat = err.seat
+    except InvalidActionError as err:
       raisedInvalid = true
+      failedSeat = err.seat
     if mode == smJunk:
       doAssert raisedInvalid, &"{mode} must raise InvalidActionError"
     else:
       doAssert raisedInfra, &"{mode} must raise LlmInfraError"
+    doAssert failedSeat == 0, &"{mode}: expected seat 0, got {failedSeat}"
     if mode == smForbidden:
       doAssert client.disabled,
         "a 403 must disable the client for the rest of the episode"
-    if mode in {smJunk, smThrottled}:
-      doAssert stubHits.load() == 4,
-        &"{mode}: {stubHits.load()} requests — an invalid reply is retried ONCE, " &
-        "as one smaller batch"
+    if mode == smSlow:
+      doAssert stubHits.load() <= 2,
+        &"{mode}: {stubHits.load()} requests — timed-out model calls must NOT be retried"
+    else:
+      doAssert stubHits.load() == 2,
+        &"{mode}: {stubHits.load()} requests — failed model calls must NOT be retried"
 
-echo "test_llm: an invalid first reply is retried once WITH THE HINT and the " &
-  "retry is recorded as source=retry"
+echo "test_llm: partial-batch failures attribute to the actual failing seat (seat 1)"
 block:
-  let run = stubbedRun(smValidThenInvalid)
-  doAssert run.hits == 4, &"{run.hits} requests"
-  for seat in 0 .. 1:
-    doAssert run.orders[seat].source == osRetry,
-      &"seat {seat} source is {run.orders[seat].source}"
+  for mode in [smSeat1Junk, smSeat1Unavailable]:
+    stubMode.store(ord(mode))
+    stubHits.store(0)
+    var cfg = variantConfig("daycare", 5)
+    cfg.llmTimeoutSeconds = 2
+    var sim = initSim(cfg)
+    sim.turn = 1
+    let client = newLlmClient(cfg)
+    var raisedInfra = false
+    var raisedInvalid = false
+    var failedSeat = -1
+    try:
+      discard client.decideAll(sim, @[0, 1],
+        @["be legible", "be legible"], @[skNone, skNone], PromptSelection())
+    except LlmInfraError as err:
+      raisedInfra = true
+      failedSeat = err.seat
+    except InvalidActionError as err:
+      raisedInvalid = true
+      failedSeat = err.seat
+    if mode == smSeat1Junk:
+      doAssert raisedInvalid, "seat 1 junk must raise InvalidActionError"
+    else:
+      doAssert raisedInfra, "seat 1 503 must raise LlmInfraError"
+    doAssert failedSeat == 1, &"{mode}: expected seat 1, got {failedSeat}"
+    doAssert stubHits.load() == 2, &"{mode}: expected 2 requests (no retry), got {stubHits.load()}"
 
 stubServer.close()
 delEnv("AWS_ENDPOINT_URL_BEDROCK_RUNTIME")

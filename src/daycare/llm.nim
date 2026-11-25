@@ -5,11 +5,11 @@
 ##
 ## Forked from `cogame-bullwhip/src/bullwhip/llm.nim`. Decisions within a turn
 ## are SIMULTANEOUS by rule, so both seats' requests go out as ONE parallel
-## batch (`curly.makeRequests`); an invalid reply is retried once as a smaller
-## batch with a hint, and anything still failing raises `LlmInfraError` or
-## `InvalidActionError` so the server terminates the unfinished episode unscored
-## with diagnostics instead of silently substituting a scripted move or
-## inventing a forfeit score.
+## batch (`curly.makeRequests`); any provider/transport failure raises
+## `LlmInfraError` and any invalid reply raises `InvalidActionError` (with the
+## actual failing seat, no retries) so the server terminates the unfinished
+## episode unscored with diagnostics instead of silently substituting a scripted
+## move or inventing a forfeit score.
 ##
 ## Measured caveat on that parallelism: curly sets CURLPIPE_MULTIPLEX, so on the
 ## FIRST batch — with no warm connection to the endpoint — libcurl holds the
@@ -541,9 +541,15 @@ proc paceDelayMs*(config: GameConfig, elapsedSeconds: float): int =
   let remaining = config.minTurnSeconds.float - elapsedSeconds
   if remaining <= 0.0: 0 else: int(remaining * 1000.0)
 
-const RetryHint = "\nYour previous reply was invalid. Respond with ONLY the " &
-  "requested JSON object, using one of the listed job and fruit values (and " &
-  "a guess, if you are the parent)."
+proc raiseLlmInfraError(seat: int, msg: string) {.noreturn.} =
+  var err = newException(LlmInfraError, msg)
+  err.seat = seat
+  raise err
+
+proc raiseInvalidActionError(seat: int, msg: string) {.noreturn.} =
+  var err = newException(InvalidActionError, msg)
+  err.seat = seat
+  raise err
 
 proc decideAll*(
   client: LlmClient,
@@ -554,9 +560,10 @@ proc decideAll*(
   selection: PromptSelection
 ): seq[Order] =
   ## One order per seat in `seats`, in order. Genuine scripted seats play their
-  ## declared baseline. Prompt seats ride ONE parallel batch per turn, retrying
-  ## once on failure; if credentials are missing or a prompt seat still fails,
-  ## this raises `DaycareError` instead of silently substituting a fallback move.
+  ## declared baseline. Prompt seats ride ONE parallel batch per turn with no
+  ## retries; if credentials are missing or any prompt seat fails, this raises
+  ## `LlmInfraError` or `InvalidActionError` attributed to the actual failing
+  ## seat instead of silently substituting a fallback move.
   result = newSeq[Order](seats.len)
   if client.capture != nil:
     client.captured = newSeq[CapturedDecision](2)
@@ -571,71 +578,65 @@ proc decideAll*(
       result[index] = scriptedOrder(sim, seat, kind)
     else:
       if client.disabled:
-        raise newException(LlmInfraError,
+        raiseLlmInfraError(seat,
           "seat " & $seat & " requires an LLM decision but LLM client is disabled")
       open.add index
-  var lastErrors = newSeq[string](seats.len)
-  var lastIsInfra = newSeq[bool](seats.len)
-  for attempt in 0 .. 1:
-    if open.len == 0 or client.disabled:
-      break
-    var batch: RequestBatch
-    let started = epochTime()
-    for index in open:
-      let seat = seats[index]
-      var user = sim.userPrompt(seat, prompts[seat])
-      if attempt > 0:
-        user.add RetryHint
-      let request = client.requestFor(systemPrompt(sim, seat, selection), user, seat)
-      if client.capture != nil:
-        client.captured[seat].beginAttempt()
-        client.captured[seat].requested(request.body, request.headers)
-      batch.post(request.url, request.headers, request.body, $index)
-    client.lastBatchSize = batch.len
-    let responses = client.curl.makeRequests(batch, client.timeoutSeconds)
-    let latencyMs = int((epochTime() - started) * 1000)
-    var stillOpen: seq[int]
-    for position, index in open:
-      let seat = seats[index]
-      if client.capture != nil:
-        if responses[position].error.len > 0:
-          client.captured[seat].transportFailed(responses[position].error, latencyMs)
-        else:
-          client.captured[seat].received(responses[position].response, latencyMs)
-      try:
-        let text = client.textOf(responses[position].response,
-          responses[position].error, batch[position].url)
-        if client.capture != nil: client.captured[seat].replyText(text)
-        var order = parseOrder(sim.roleOf[seat], extractJsonObject(text))
-        if client.capture != nil:
-          client.captured[seat].parsedProposal(orderJson(sim.roleOf[seat], order))
-        ## Reject illegal orders HERE so the retry carries the hint.
-        sim.validateOrder(seat, order)
-        order.source = if attempt == 0: osLlm else: osRetry
-        order.latencyMs = latencyMs
-        result[index] = order
-      except LlmInfraError as error:
-        if client.capture != nil: client.captured[seat].rejectedAttempt(error.msg)
-        lastErrors[index] = cleanText(error.msg, MaxErrorTextLen)
-        lastIsInfra[index] = true
-        echo "daycare llm: seat ", seat, " attempt ", attempt, " infra error: ",
-          lastErrors[index]
-        stillOpen.add index
-      except CatchableError as error:
-        if client.capture != nil: client.captured[seat].rejectedAttempt(error.msg)
-        lastErrors[index] = cleanText(error.msg, MaxErrorTextLen)
-        lastIsInfra[index] = false
-        echo "daycare llm: seat ", seat, " attempt ", attempt, " failed: ",
-          lastErrors[index]
-        stillOpen.add index
-    open = stillOpen
-  if open.len > 0:
-    let index = open[0]
+  if open.len == 0:
+    return
+  var batch: RequestBatch
+  let started = epochTime()
+  for index in open:
     let seat = seats[index]
-    let detail = if lastErrors[index].len > 0: lastErrors[index]
-      else: "no valid LLM order"
-    if lastIsInfra[index]:
-      raise newException(LlmInfraError,
-        "seat " & $seat & " LLM infrastructure failure: " & detail)
-    raise newException(InvalidActionError,
-      "seat " & $seat & " failed to produce a valid order: " & detail)
+    let user = sim.userPrompt(seat, prompts[seat])
+    let request = client.requestFor(systemPrompt(sim, seat, selection), user, seat)
+    if client.capture != nil:
+      client.captured[seat].beginAttempt()
+      client.captured[seat].requested(request.body, request.headers)
+    batch.post(request.url, request.headers, request.body, $index)
+  client.lastBatchSize = batch.len
+  let responses = client.curl.makeRequests(batch, client.timeoutSeconds)
+  let latencyMs = int((epochTime() - started) * 1000)
+  var failedSeat = -1
+  var failedIsInfra = false
+  var failedDetail = ""
+  for position, index in open:
+    let seat = seats[index]
+    if client.capture != nil:
+      if responses[position].error.len > 0:
+        client.captured[seat].transportFailed(responses[position].error, latencyMs)
+      else:
+        client.captured[seat].received(responses[position].response, latencyMs)
+    try:
+      let text = client.textOf(responses[position].response,
+        responses[position].error, batch[position].url)
+      if client.capture != nil: client.captured[seat].replyText(text)
+      var order = parseOrder(sim.roleOf[seat], extractJsonObject(text))
+      if client.capture != nil:
+        client.captured[seat].parsedProposal(orderJson(sim.roleOf[seat], order))
+      sim.validateOrder(seat, order)
+      order.source = osLlm
+      order.latencyMs = latencyMs
+      result[index] = order
+    except LlmInfraError as error:
+      if client.capture != nil: client.captured[seat].rejectedAttempt(error.msg)
+      let detail = cleanText(error.msg, MaxErrorTextLen)
+      echo "daycare llm: seat ", seat, " infra error: ", detail
+      if failedSeat < 0:
+        failedSeat = seat
+        failedIsInfra = true
+        failedDetail = detail
+    except CatchableError as error:
+      if client.capture != nil: client.captured[seat].rejectedAttempt(error.msg)
+      let detail = cleanText(error.msg, MaxErrorTextLen)
+      echo "daycare llm: seat ", seat, " failed: ", detail
+      if failedSeat < 0:
+        failedSeat = seat
+        failedIsInfra = false
+        failedDetail = detail
+  if failedSeat >= 0:
+    let detail = if failedDetail.len > 0: failedDetail else: "no valid LLM order"
+    if failedIsInfra:
+      raiseLlmInfraError(failedSeat,
+        "seat " & $failedSeat & " LLM infrastructure failure: " & detail)
+    raiseInvalidActionError(failedSeat,
+      "seat " & $failedSeat & " failed to produce a valid order: " & detail)

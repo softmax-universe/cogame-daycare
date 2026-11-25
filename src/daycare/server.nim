@@ -231,21 +231,39 @@ proc finishEpisode(runtimeConfig: RuntimeConfig) =
 
 proc failEpisode(runtimeConfig: RuntimeConfig, capture: RuntimeCapture,
     captured: seq[CapturedDecision], cause, detail: string,
-    seat = -1, turn = 0) =
+    kind = "player_error", seat = -1, turn = 0) =
   ## Terminates an unfinished episode unscored with failure diagnostics: writes
-  ## COGAME_PLAYER_FAILURE_URI and COGAME_LOG_URI (when configured), preserves
-  ## any private capture attempts with esFailed and null scores, notifies
-  ## connected players so they exit cleanly, and exits non-zero WITHOUT writing
-  ## results.json or replay.json (no invented winner, forfeit score, or payoff).
-  var failurePayload: JsonNode
+  ## Coworld's closed GamePlayerFailure JSON to COGAME_PLAYER_FAILURE_URI when
+  ## an actual failing seat is known, writes detailed game diagnostics to
+  ## COGAME_LOG_URI (when configured), preserves any private capture attempts
+  ## with esFailed and null scores, notifies connected players so they exit
+  ## cleanly, and exits non-zero WITHOUT writing results.json or replay.json
+  ## (no invented winner, forfeit score, or payoff).
+  let failureKind =
+    if kind == "episode_inconclusive": "episode_inconclusive"
+    else: "player_error"
+  let cleanDetail = cleanText(detail, MaxErrorTextLen)
+  let failureMessage =
+    if cleanDetail.len > 0: cleanDetail
+    elif seat >= 0: "seat " & $seat & " failed (" & cause & ")"
+    else: "episode failed (" & cause & ")"
+  var playerFailurePayload: JsonNode
+  var diagnosticPayload: JsonNode
   withLock stateLock:
     if state.finished:
       return
     state.finished = true
-    failurePayload = %*{
+    if seat >= 0:
+      playerFailurePayload = %*{
+        "failed_policy_index": seat,
+        "message": failureMessage,
+        "kind": failureKind
+      }
+    diagnosticPayload = %*{
       "status": "failed",
+      "kind": failureKind,
       "cause": cause,
-      "detail": cleanText(detail, MaxErrorTextLen),
+      "detail": failureMessage,
       "seat": seat,
       "turn": turn,
       "turns_completed": state.sim.turnsPlayed,
@@ -257,7 +275,7 @@ proc failEpisode(runtimeConfig: RuntimeConfig, capture: RuntimeCapture,
       "done": true,
       "failed": true,
       "cause": cause,
-      "error": cleanText(detail, MaxErrorTextLen),
+      "error": failureMessage,
       "turn": turn
     }
     for slot, socket in state.playerSockets:
@@ -268,18 +286,18 @@ proc failEpisode(runtimeConfig: RuntimeConfig, capture: RuntimeCapture,
         discard
 
   sleep(200)
-  echo "daycare: episode failed unscored (cause=", cause, ", seat=", seat,
-    ", turn=", turn, "): ", detail
+  echo "daycare: episode failed unscored (kind=", failureKind, ", cause=",
+    cause, ", seat=", seat, ", turn=", turn, "): ", detail
   let failureUri = getEnv("COGAME_PLAYER_FAILURE_URI").strip()
-  if failureUri.len > 0:
+  if failureUri.len > 0 and not playerFailurePayload.isNil:
     try:
-      writeArtifact(failureUri, $failurePayload, "application/json",
+      writeArtifact(failureUri, $playerFailurePayload, "application/json",
         "COGAME_PLAYER_FAILURE_METHOD")
     except CatchableError as error:
       echo "daycare: failed writing COGAME_PLAYER_FAILURE_URI: ", error.msg
   if runtimeConfig.logUri.len > 0:
     try:
-      writeArtifact(runtimeConfig.logUri, $failurePayload & "\n",
+      writeArtifact(runtimeConfig.logUri, $diagnosticPayload & "\n",
         "application/json", "COGAME_LOG_METHOD")
     except CatchableError as error:
       echo "daycare: failed writing COGAME_LOG_URI: ", error.msg
@@ -287,7 +305,7 @@ proc failEpisode(runtimeConfig: RuntimeConfig, capture: RuntimeCapture,
     for slot in 0 .. 1:
       if slot < captured.len and captured[slot] != nil:
         capture.recordFailedDecision(captured[slot], slot, cause, detail)
-    capture.finishFailedCapture(failurePayload)
+    capture.finishFailedCapture(diagnosticPayload)
   quit(1)
 
 # ---------------------------------------------------------------------------
@@ -420,6 +438,7 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
       let batchStart = epochTime()
       var orders: array[2, Order]
       var turnFailed = false
+      var failureKind = "player_error"
       var failureCause = ""
       var failureDetail = ""
       var failureSeat = -1
@@ -431,14 +450,19 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
             orders[slot] = nativeOrders[i]
         except LlmInfraError as error:
           turnFailed = true
+          failureKind = "episode_inconclusive"
           failureCause = "infra_error"
+          failureSeat = error.seat
           failureDetail = error.msg
         except InvalidActionError as error:
           turnFailed = true
+          failureKind = "player_error"
           failureCause = "invalid_action"
+          failureSeat = error.seat
           failureDetail = error.msg
         except CatchableError as error:
           turnFailed = true
+          failureKind = "player_error"
           failureCause = "invalid_action"
           failureDetail = error.msg
       if not turnFailed and (external[0] or external[1]):
@@ -450,6 +474,7 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
               if external[slot]:
                 if not state.playerSockets.hasKey(slot):
                   turnFailed = true
+                  failureKind = "player_error"
                   failureCause = "player_error"
                   failureSeat = slot
                   failureDetail = "seat " & $slot & " disconnected"
@@ -467,6 +492,7 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
           for slot in 0 .. 1:
             if not state.playerSockets.hasKey(slot):
               turnFailed = true
+              failureKind = "player_error"
               failureCause = "player_error"
               failureSeat = slot
               failureDetail = "seat " & $slot & " disconnected"
@@ -476,18 +502,22 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
                 orders[slot] = state.pendingOrders[slot]
               else:
                 turnFailed = true
+                failureKind = "player_error"
                 failureCause = "invalid_action"
                 failureSeat = slot
                 failureDetail = "seat " & $slot & " failed to send a valid action in time"
                 break
         if not turnFailed:
-          try:
-            for slot in 0 .. 1:
+          for slot in 0 .. 1:
+            try:
               state.sim.validateOrder(slot, orders[slot])
-          except CatchableError as error:
-            turnFailed = true
-            failureCause = "invalid_action"
-            failureDetail = error.msg
+            except CatchableError as error:
+              turnFailed = true
+              failureKind = "player_error"
+              failureCause = "invalid_action"
+              failureSeat = slot
+              failureDetail = error.msg
+              break
         if turnFailed:
           failNow = true
         else:
@@ -517,7 +547,7 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
 
       if failNow:
         failEpisode(runtimeConfig, capture, client.captured, failureCause,
-          failureDetail, seat = failureSeat, turn = turn)
+          failureDetail, kind = failureKind, seat = failureSeat, turn = turn)
         return
 
       ## `minTurnSeconds` floors the spacing between batch STARTS, so the

@@ -93,8 +93,8 @@ existing spectator replay remains a post-episode record and includes secret and 
 observation or a model completion.
 
 The native parser also checks consumed `hunch` and `notes` strings for Unicode scalar UTF-8 before cleaning them.
-Invalid consumed text, unknown fields, legacy aliases, surrounding prose, and extra JSON objects are rejected and follow
-the retry-then-fail path (unscored episode termination with diagnostics; no silent `caretaker` fallback and no invented
+Invalid consumed text, unknown fields, legacy aliases, surrounding prose, and extra JSON objects are rejected and fail
+immediately without retrying (unscored episode termination with diagnostics; no silent `caretaker` fallback and no invented
 forfeit score). Direct native order application performs this preflight before cleaning or changing state. This
 validation is independent of capture.
 

@@ -93,10 +93,10 @@ The model answers with exactly one JSON object (bare or inside a single ordinary
 returned to it next turn. Neither ever reaches the other seat — that is how "no explicit channel" is enforced
 mechanically rather than by convention. Every recorded string is truncated on **rune** boundaries.
 
-An invalid prompt reply is retried once with a hint; if a seat still fails to produce a valid order (or disconnects,
-times out, hits a provider/transport error, or runs a prompt seat without LLM credentials), the unfinished episode
-terminates unscored with failure diagnostics (`COGAME_PLAYER_FAILURE_URI` / non-zero exit, no `results.json`) rather
-than silently substituting a scripted move or inventing a forfeit score. The release certification fixture seats the
+If a seat fails to produce a valid order (or disconnects, times out, hits a provider/transport error, or runs a prompt
+seat without LLM credentials), the unfinished episode terminates immediately without retrying model calls, unscored with
+Coworld failure diagnostics (`COGAME_PLAYER_FAILURE_URI` / non-zero exit, no `results.json`) rather than silently
+substituting a scripted move or inventing a forfeit score. The release certification fixture seats the
 native model player (`daycare-player`) alongside the bundled scripted baseline (`daycare-caretaker`); `daycare-stubborn`
 remains available as a separately uploaded policy (`tools/ci/policies.json`) or via
 `--run /bin/daycare-player --secret-env PLAYER_SCRIPTED=stubborn`, and offline scripted smoke/tests explicitly pass
