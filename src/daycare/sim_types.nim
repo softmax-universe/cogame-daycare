@@ -105,7 +105,9 @@ const
 type
   DaycareError* = object of CatchableError
   LlmInfraError* = object of DaycareError
+    seat*: int
   InvalidActionError* = object of DaycareError
+    seat*: int
 
   Fruit* = enum
     fApple = "apple"

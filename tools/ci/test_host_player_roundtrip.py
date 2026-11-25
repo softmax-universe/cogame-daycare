@@ -8,14 +8,16 @@ local stub Coworld LLM sidecar across:
      model-produced actions executed, no player_failure.json, and private
      trajectory marks all model turns accepted with raw text preserved.
   2. Invalid / ambiguous reply (surrounding prose + extra object) -> episode
-     terminates unfinished unscored (exit != 0, player_failure.json with
-     cause == "invalid_action", NO results.json, NO replay.json).
-  3. Provider failure (HTTP 500) -> episode terminates unfinished unscored
-     (exit != 0, player_failure.json with cause == "infra_error",
-     NO results.json, NO replay.json).
+     terminates unfinished unscored (exit != 0, player_failure.json with closed
+     GamePlayerFailure schema kind == "player_error" and actual failing seat,
+     NO retries, NO results.json, NO replay.json).
+  3. Provider failure (HTTP 503 / HTTP 500) -> episode terminates unfinished
+     unscored (exit != 0, player_failure.json with closed GamePlayerFailure
+     schema kind == "episode_inconclusive" and actual interrupted seat,
+     NO retries, NO results.json, NO replay.json).
   4. Missing credentials (prompt seat with no LLM endpoint/keys) -> episode
      terminates unfinished unscored (exit != 0, player_failure.json with
-     cause == "infra_error", NO results.json, NO replay.json).
+     kind == "episode_inconclusive", NO results.json, NO replay.json).
   5. Purely scripted offline certification (caretaker vs stubborn, no LLM env)
      -> completes exit 0 with genuine numeric scores and replay.
 """
@@ -62,9 +64,10 @@ def make_stub_server(mode: str, on_call=None):
             calls.append({"slot": slot, "mode": mode})
             if on_call is not None:
                 on_call(len(calls), slot)
-            if mode == "provider_500":
-                body = json.dumps({"error": "upstream 500"}).encode()
-                self.send_response(500)
+            if mode in ("provider_500", "provider_503"):
+                status_code = 503 if mode == "provider_503" else 500
+                body = json.dumps({"error": f"upstream {status_code}"}).encode()
+                self.send_response(status_code)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
@@ -265,18 +268,35 @@ def run_scenario(game_bin: Path, player_bin: Path, name: str, mode: str,
                 assert game.returncode != 0, f"{name}: expected non-zero exit, got 0\n{game_out}"
                 assert not results_exists, f"{name}: results.json must NOT be written on failure"
                 assert not replay_exists, f"{name}: replay.json must NOT be written on failure"
-                assert failure_exists, f"{name}: player_failure.json missing\n{game_out}"
-                failure = json.loads((work / "player_failure.json").read_text())
                 if disconnect_slot is not None or len(connect_slots) < 2:
+                    expected_kind = "player_error"
                     expected_cause = "player_error"
                 elif mode == "ambiguous":
+                    expected_kind = "player_error"
                     expected_cause = "invalid_action"
                 else:
+                    expected_kind = "episode_inconclusive"
                     expected_cause = "infra_error"
-                assert failure["cause"] == expected_cause, f"{name}: {failure}"
+                if expected_seat is not None and expected_seat < 0:
+                    assert not failure_exists, f"{name}: must not invent a seat in player_failure.json"
+                else:
+                    assert failure_exists, f"{name}: player_failure.json missing\n{game_out}"
+                    failure = json.loads((work / "player_failure.json").read_text())
+                    assert set(failure.keys()) == {"failed_policy_index", "message", "kind"}, f"{name}: {failure}"
+                    assert failure["kind"] == expected_kind, f"{name}: {failure}"
+                    assert isinstance(failure["failed_policy_index"], int) and failure["failed_policy_index"] >= 0, f"{name}: {failure}"
+                    assert isinstance(failure["message"], str) and 1 <= len(failure["message"]) <= 2000, f"{name}: {failure}"
+                    if expected_seat is not None:
+                        assert failure["failed_policy_index"] == expected_seat, f"{name}: expected seat {expected_seat}, got {failure}"
+                if use_llm and disconnect_slot is None and len(connect_slots) == 2:
+                    llm_seats = sum(1 for s in scripted_seats if not s)
+                    assert len(calls) == llm_seats, f"{name}: expected {llm_seats} calls (no retries), got {len(calls)}"
+                log_path = work / "game.log"
+                assert log_path.exists(), f"{name}: game.log missing"
+                diag = json.loads(log_path.read_text().strip().splitlines()[-1])
+                assert diag["cause"] == expected_cause, f"{name}: {diag}"
                 if expected_seat is not None:
-                    assert failure["seat"] == expected_seat, f"{name}: expected seat {expected_seat}, got {failure}"
-                assert "scores" not in failure and "win" not in failure
+                    assert diag["seat"] == expected_seat, f"{name}: expected diag seat {expected_seat}, got {diag}"
                 if traj_path.exists():
                     traj_rows = [json.loads(l) for l in traj_path.read_text().splitlines() if l.strip()]
                     ep = [r for r in traj_rows if r["event_type"] == "episode"][-1]
@@ -307,9 +327,10 @@ def main():
         scripted_seats=("", "caretaker"),
         use_llm=True,
     )
-    run_scenario(args.game, args.player, "invalid_ambiguous_object", "ambiguous", use_llm=True)
-    run_scenario(args.game, args.player, "provider_http_500", "provider_500", use_llm=True)
-    run_scenario(args.game, args.player, "missing_credentials", "missing_creds", use_llm=False)
+    run_scenario(args.game, args.player, "invalid_ambiguous_object", "ambiguous", use_llm=True, expected_seat=0)
+    run_scenario(args.game, args.player, "provider_http_503", "provider_503", scripted_seats=("", "caretaker"), use_llm=True, expected_seat=0)
+    run_scenario(args.game, args.player, "provider_http_500", "provider_500", use_llm=True, expected_seat=0)
+    run_scenario(args.game, args.player, "missing_credentials", "missing_creds", use_llm=False, expected_seat=0)
     run_scenario(
         args.game,
         args.player,
