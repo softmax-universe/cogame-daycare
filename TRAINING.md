@@ -93,9 +93,9 @@ existing spectator replay remains a post-episode record and includes secret and 
 observation or a model completion.
 
 The native parser also checks consumed `hunch` and `notes` strings for Unicode scalar UTF-8 before cleaning them.
-Invalid consumed text follows the existing retry and caretaker fallback path. Direct native order application performs
-this preflight before cleaning or changing state. Ignored outer JSON fields remain ignored by gameplay. This validation
-is independent of capture.
+Invalid consumed text, unknown fields, legacy aliases, surrounding prose, and extra JSON objects are rejected and follow
+the retry-then-forfeit path (no silent `caretaker` fallback). Direct native order application performs this preflight
+before cleaning or changing state. This validation is independent of capture.
 
 Selection requires a completed joined 2xx response, no prior rejection, strict JSON grammar and decoded-key uniqueness,
 scalar UTF-8, and unchanged types and values for every supplied field compared with the installed action. Native fences

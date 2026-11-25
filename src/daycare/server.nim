@@ -259,17 +259,22 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
       sleep(50)
 
     var connected = 0
+    var unregistered = false
     withLock stateLock:
       state.started = true
       connected = state.playerSockets.len
+      for slot in 0 .. 1:
+        if state.playerSockets.hasKey(slot) and not state.registered[slot]:
+          unregistered = true
       echo "daycare: starting with ", connected, "/2 players connected"
       state.broadcastLocked()
 
-    if connected == 0:
-      ## No seat present at all -> forfeit. A MISSING seat does not end the
-      ## episode: it plays `caretaker` and the game runs.
-      echo "daycare: no player connected within ",
-        config.playerConnectTimeoutSeconds, "s; forfeit"
+    if connected < 2 or unregistered:
+      if connected < 2:
+        echo "daycare: only ", connected, "/2 players connected within ",
+          config.playerConnectTimeoutSeconds, "s; forfeit"
+      else:
+        echo "daycare: player failed to register within 2s; forfeit"
       withLock stateLock:
         state.sim.forfeit()
         state.broadcastLocked()
@@ -302,11 +307,22 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
       var prompts: seq[string]
       var scriptedKinds: seq[ScriptKind]
       var external: seq[bool]
+      var nativeSeats: seq[int]
+      var disconnectedSlot = -1
       withLock stateLock:
         if playDeadline > 0.0 and epochTime() > playDeadline:
           echo "daycare: episode deadline reached after ",
             state.sim.turnsPlayed, "/", config.turns, " turns; ending early"
           state.sim.endEarly()
+          state.broadcastLocked()
+          break
+        for slot in 0 .. 1:
+          if not state.playerSockets.hasKey(slot):
+            disconnectedSlot = slot
+            break
+        if disconnectedSlot >= 0:
+          echo "daycare: seat ", disconnectedSlot, " disconnected; forfeit"
+          state.sim.forfeit()
           state.broadcastLocked()
           break
         state.sim.turn = turn
@@ -315,52 +331,75 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
         scriptedKinds = state.scripted
         external = state.external
         state.awaitingTurn = turn
-        ## A seat whose socket died mid-episode plays `caretaker` for every
-        ## remaining turn; the episode never blocks on a socket.
         for slot in 0 .. 1:
-          if not state.playerSockets.hasKey(slot) and
-              scriptedKinds[slot] == skNone:
-            scriptedKinds[slot] = skCaretaker
-          if external[slot] and state.playerSockets.hasKey(slot):
-            scriptedKinds[slot] = skCaretaker
+          if external[slot]:
             state.received[slot] = false
             state.playerSockets[slot].send($ %*{
               "type": "observation", "turn": turn,
               "observation": state.sim.playerStateJson(slot)})
           else:
-            external[slot] = false
+            nativeSeats.add slot
 
       let batchStart = epochTime()
-      var orders = client.decideAll(simCopy, @[0, 1], prompts, scriptedKinds, state.selection)
-      let actionDeadline = batchStart + config.llmTimeoutSeconds.float
-      while epochTime() < actionDeadline:
-        var waiting = false
-        withLock stateLock:
-          for slot in 0 .. 1:
-            if external[slot] and not state.received[slot]:
-              waiting = true
-        if not waiting:
-          break
-        sleep(20)
+      var orders: array[2, Order]
+      var turnFailed = false
+      var failureDetail = ""
+      if nativeSeats.len > 0:
+        try:
+          let nativeOrders = client.decideAll(simCopy, nativeSeats, prompts,
+            scriptedKinds, state.selection)
+          for i, slot in nativeSeats:
+            orders[slot] = nativeOrders[i]
+        except CatchableError as error:
+          turnFailed = true
+          failureDetail = error.msg
+      if not turnFailed and (external[0] or external[1]):
+        let actionDeadline = batchStart + config.llmTimeoutSeconds.float
+        while epochTime() < actionDeadline:
+          var waiting = false
+          withLock stateLock:
+            for slot in 0 .. 1:
+              if external[slot]:
+                if not state.playerSockets.hasKey(slot):
+                  turnFailed = true
+                  failureDetail = "seat " & $slot & " disconnected"
+                  break
+                if not state.received[slot]:
+                  waiting = true
+          if turnFailed or not waiting:
+            break
+          sleep(20)
 
       withLock stateLock:
         state.awaitingTurn = 0
-        for slot in 0 .. 1:
-          if external[slot]:
-            if state.received[slot]:
-              orders[slot] = state.pendingOrders[slot]
-            else:
-              orders[slot].source = osFallback
-        for slot in 0 .. 1:
-          var order = orders[slot]
+        if not turnFailed:
+          for slot in 0 .. 1:
+            if not state.playerSockets.hasKey(slot):
+              turnFailed = true
+              failureDetail = "seat " & $slot & " disconnected"
+              break
+            if external[slot]:
+              if state.received[slot]:
+                orders[slot] = state.pendingOrders[slot]
+              else:
+                turnFailed = true
+                failureDetail = "seat " & $slot & " failed to send a valid action in time"
+                break
+        if not turnFailed:
           try:
-            state.sim.applyOrder(slot, order)
+            for slot in 0 .. 1:
+              state.sim.validateOrder(slot, orders[slot])
           except CatchableError as error:
-            echo "daycare: order rejected (", error.msg,
-              "); using the caretaker order"
-            var fallback = scriptedOrder(state.sim, slot, skCaretaker)
-            fallback.source = osFallback
-            state.sim.applyOrder(slot, fallback)
+            turnFailed = true
+            failureDetail = error.msg
+        if turnFailed:
+          echo "daycare: turn ", turn, " failed (", failureDetail, "); forfeit"
+          state.sim.forfeit()
+          state.broadcastLocked()
+          break
+        for slot in 0 .. 1:
+          let order = orders[slot]
+          state.sim.applyOrder(slot, order)
           echo "daycare: turn ", turn, " ", state.sim.names[slot], " (",
             state.sim.roleOf[slot], ") ", state.sim.jobName(slot),
             (if order.hasFruit: " " & $order.fruit else: ""),
@@ -368,16 +407,17 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
             " at ", (epochTime() - gameStart).int, "s"
         if capture != nil:
           for slot in 0 .. 1:
-            var ownEvent = newJNull()
-            for index in countdown(state.sim.events.high, 0):
-              let event = state.sim.events[index]
-              if event{"k"}.getStr() == "order" and event{"seat"}.getInt(-1) == slot and event{"turn"}.getInt() == turn:
-                ownEvent = copy(event)
-                break
-            let installed = state.sim.lastOrders[slot]
-            capture.applied(client.captured[slot], slot,
-              orderJson(state.sim.roleOf[slot], installed), ownEvent,
-              $installed.source, state.sim.nativeStateHash(slot))
+            if slot < client.captured.len and client.captured[slot] != nil:
+              var ownEvent = newJNull()
+              for index in countdown(state.sim.events.high, 0):
+                let event = state.sim.events[index]
+                if event{"k"}.getStr() == "order" and event{"seat"}.getInt(-1) == slot and event{"turn"}.getInt() == turn:
+                  ownEvent = copy(event)
+                  break
+              let installed = state.sim.lastOrders[slot]
+              capture.applied(client.captured[slot], slot,
+                orderJson(state.sim.roleOf[slot], installed), ownEvent,
+                $installed.source, state.sim.nativeStateHash(slot))
         state.sim.playTurn()
         state.broadcastLocked()
 
@@ -539,14 +579,26 @@ proc websocketHandler(
             state.registered[slot] = true
           return
         if payload{"type"}.getStr() == "action":
-          withLock stateLock:
-            if state.external[slot] and state.awaitingTurn ==
-                payload["turn"].getInt() and not state.received[slot]:
-              var order = parseOrder(state.sim.roleOf[slot], payload["order"])
-              state.sim.validateOrder(slot, order)
-              order.source = osExternal
-              state.pendingOrders[slot] = order
-              state.received[slot] = true
+          let turnNode = payload{"turn"}
+          let turnNum =
+            if not turnNode.isNil and turnNode.kind == JInt: turnNode.getInt()
+            else: -1
+          try:
+            withLock stateLock:
+              if state.external[slot] and state.awaitingTurn == turnNum and
+                  not state.received[slot]:
+                var order = parseOrder(state.sim.roleOf[slot], payload{"order"})
+                state.sim.validateOrder(slot, order)
+                order.source = osExternal
+                state.pendingOrders[slot] = order
+                state.received[slot] = true
+          except CatchableError as error:
+            echo "daycare: rejecting bad action from slot ", slot, ": ", error.msg
+            websocket.send($ %*{
+              "type": "error",
+              "turn": turnNum,
+              "error": cleanText(error.msg, MaxErrorTextLen)
+            })
           return
         if payload{"type"}.getStr() != "prompt":
           echo "daycare: ignoring player frame of type ",
@@ -557,10 +609,9 @@ proc websocketHandler(
           prompt = prompt.runeSubStr(0, MaxPromptLen)
         let node = payload{"scripted"}
         let kind =
-          if node.isNil: skNone
-          elif node.kind == JBool:
-            (if node.getBool(): skCaretaker else: skNone)
-          else: parseScriptKind(node.getStr())
+          if node.isNil or node.kind == JNull: skNone
+          elif node.kind == JString: parseScriptKind(node.getStr())
+          else: raise newException(DaycareError, "scripted must be a string")
         withLock stateLock:
           state.prompts[slot] = prompt
           state.scripted[slot] = kind

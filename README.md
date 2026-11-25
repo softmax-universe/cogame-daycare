@@ -77,7 +77,7 @@ coworld upload-policy coworld-daycare:latest --name my-baseline \
 External action players receive the same private role observation and return a complete standing order. The game
 validates orders and owns results and replay.
 
-The model answers with exactly one JSON object:
+The model answers with exactly one JSON object (bare or inside a single ordinary outer Markdown code fence, JSON-tagged or plain; surrounding prose and extra objects are rejected):
 
 ```json
 {
@@ -93,15 +93,16 @@ The model answers with exactly one JSON object:
 returned to it next turn. Neither ever reaches the other seat — that is how "no explicit channel" is enforced
 mechanically rather than by convention. Every recorded string is truncated on **rune** boundaries.
 
-An invalid reply is retried once with a hint; still failing, that seat plays the `caretaker` order for the turn and the
-`order` event records `"source":"fallback"`. With no credentials at all the client disables itself immediately and both
-seats play `caretaker`, which is what keeps offline certification green and deterministic.
+An invalid prompt reply is retried once with a hint; if a seat still fails to produce a valid order (or disconnects,
+times out, or runs a prompt seat without LLM credentials), the episode forfeits (`reason="forfeit"`, `ending="forfeit"`)
+rather than silently substituting a scripted move. Offline certification uses the explicit scripted baselines
+(`daycare-caretaker` and `daycare-stubborn`), which require no LLM credentials.
 
 Full per-role schema: `game.docs.pages[policies.md]` in `coworld_manifest_template.json`.
 
 ## Baselines
 
-- **`caretaker`** — the working baseline, and the order every failed LLM decision lands on. As the parent it weighs the
+- **`caretaker`** — the working scripted baseline. As the parent it weighs the
   child's cumulative behaviour summary (failed reaches first, then refusals, then adjacency, then meals), guesses and
   provides. As the child it seeks its own species when it can, and otherwise stands under a tall tree of that species
   and reaches.

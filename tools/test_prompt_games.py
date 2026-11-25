@@ -95,7 +95,6 @@ def play(variant, seed, wording, prompt_seed, normalize=False):
                     assert own_marker * 239 + "…" in messages[1]["content"]
                 proposal["hunch"] = own_marker * 100
                 proposal["notes"] = own_marker * 270
-                proposal["job"] = proposal["job"].upper()
                 if role == "parent" and proposal["fruit"] is not None:
                     proposal["guess"] = (
                         "banana" if proposal["fruit"] == "apple" else "apple"
@@ -112,7 +111,7 @@ def play(variant, seed, wording, prompt_seed, normalize=False):
             if normalize:
                 assert accepted["action"]["hunch"] == own_marker * 79 + "…"
                 assert accepted["action"]["notes"] == own_marker * 239 + "…"
-                assert accepted["action"]["job"] == proposal["job"].lower()
+                assert accepted["action"]["job"] == proposal["job"]
                 assert accepted["action"]["guess"] == proposal["guess"]
             else:
                 assert accepted["action"] == proposal

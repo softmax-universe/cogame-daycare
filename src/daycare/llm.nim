@@ -6,8 +6,8 @@
 ## Forked from `cogame-bullwhip/src/bullwhip/llm.nim`. Decisions within a turn
 ## are SIMULTANEOUS by rule, so both seats' requests go out as ONE parallel
 ## batch (`curly.makeRequests`); an invalid reply is retried once as a smaller
-## batch with a hint, and anything still failing falls back to the `caretaker`
-## order.
+## batch with a hint, and anything still failing raises `DaycareError` so the
+## server forfeits the episode instead of silently substituting a scripted move.
 ##
 ## Measured caveat on that parallelism: curly sets CURLPIPE_MULTIPLEX, so on the
 ## FIRST batch — with no warm connection to the endpoint — libcurl holds the
@@ -23,8 +23,9 @@
 ##   ANTHROPIC_API_KEY                - the key itself
 ##   ANTHROPIC_API_KEY_URI            - a URI holding the key
 ## With no credentials the client disables itself immediately (no retries, no
-## network waits) and both seats play `caretaker` — which is what keeps offline
-## certification green and deterministic. This fallback is load-bearing.
+## network waits). Genuine scripted baselines (`PLAYER_SCRIPTED=caretaker` or
+## `stubborn`) still run offline; prompt seats fail when no LLM transport is
+## configured.
 
 import
   std/[json, math, os, strutils, times, unicode],
@@ -135,7 +136,7 @@ proc newLlmClient*(config: GameConfig): LlmClient =
   else:
     result.transport = ltNone
     result.disabled = true
-    echo "daycare llm: no LLM credentials; using scripted fallback"
+    echo "daycare llm: no LLM credentials; prompt seats will fail"
 
 # ---- prompt building --------------------------------------------------------
 
@@ -348,17 +349,37 @@ proc userPrompt*(sim: Sim, seat: int, prompt: string): string =
 # ---- transport --------------------------------------------------------------
 
 proc extractJsonObject*(text: string): JsonNode =
-  ## Pulls the first {...} object out of a model response, tolerating fences and
-  ## a prose prefix or suffix.
-  let start = text.find('{')
-  let stop = text.rfind('}')
-  if start < 0 or stop <= start:
-    var head = text.strip()
+  ## Parses exactly one JSON object, either bare or inside a single ordinary
+  ## outer Markdown code fence (JSON-tagged or plain). Rejects surrounding
+  ## unrelated prose, extra objects, and non-object JSON.
+  let trimmed = text.strip()
+  if trimmed.len == 0:
+    raise newException(DaycareError, "empty response")
+  var candidate = trimmed
+  if trimmed.startsWith("```"):
+    let firstNl = trimmed.find('\n')
+    if firstNl < 0:
+      raise newException(DaycareError, "unterminated markdown code fence")
+    let tag = trimmed[3 ..< firstNl].strip().toLowerAscii()
+    if tag.len > 0 and tag != "json":
+      raise newException(DaycareError, "unsupported markdown fence tag: " & tag)
+    if not trimmed.endsWith("\n```") or firstNl + 1 >= trimmed.len - 3:
+      raise newException(DaycareError,
+        "unterminated markdown code fence or trailing text")
+    candidate = trimmed[firstNl + 1 ..< trimmed.len - 4].strip()
+  if candidate.len == 0 or candidate[0] != '{' or candidate[^1] != '}':
+    var head = trimmed
     if head.runeLen > 160:
       head = head.runeSubStr(0, 160) & "..."
-    raise newException(DaycareError, "no JSON object in response: " &
+    raise newException(DaycareError,
+      "reply must be a single JSON object (bare or in one markdown code fence): " &
       head.replace("\n", " "))
-  parseJson(text[start .. stop])
+  try:
+    result = parseJson(candidate)
+  except CatchableError as error:
+    raise newException(DaycareError, "invalid JSON object: " & error.msg)
+  if result.kind != JObject:
+    raise newException(DaycareError, "reply JSON must be an object")
 
 proc requestFor(client: LlmClient, system, user: string, slot: int):
     tuple[url: string, headers: HttpHeaders, body: string] =
@@ -425,7 +446,7 @@ proc textOf(client: LlmClient, response: Response, error, url: string): string =
 # ---- reply parsing ----------------------------------------------------------
 
 proc parseParentJob*(text: string): ParentJob =
-  case text.strip().toLowerAscii()
+  case text
   of "provide": pjProvide
   of "stock": pjStock
   of "watch": pjWatch
@@ -434,7 +455,7 @@ proc parseParentJob*(text: string): ParentJob =
     "job must be one of " & ParentJobNames.join(" | ") & ": " & text)
 
 proc parseChildJob*(text: string): ChildJob =
-  case text.strip().toLowerAscii()
+  case text
   of "seek": cjSeek
   of "show": cjShow
   of "graze": cjGraze
@@ -444,17 +465,32 @@ proc parseChildJob*(text: string): ChildJob =
     "job must be one of " & ChildJobNames.join(" | ") & ": " & text)
 
 proc parseOrder*(role: Role, payload: JsonNode): Order =
-  ## Extra keys are ignored. A `guess` that disagrees with the `fruit` being
-  ## delivered is ACCEPTED AS WRITTEN — testing a hypothesis by delivering the
-  ## other species must stay expressible.
-  # Validate only consumed strings, before cleaning can discard invalid bytes.
-  # Unknown/ignored fields retain the native parser's existing behavior.
+  ## Parses one standing order for `role`. Only documented fields are accepted
+  ## (`job`, `fruit`, `guess`, `hunch`, `notes`). A parent `guess` that
+  ## disagrees with the `fruit` being delivered is ACCEPTED AS WRITTEN —
+  ## testing a hypothesis by delivering the other species must stay expressible.
+  if payload.isNil or payload.kind != JObject:
+    raise newException(DaycareError, "order must be a JSON object")
+  for key, _ in payload:
+    if key notin ["job", "fruit", "guess", "hunch", "notes"]:
+      raise newException(DaycareError, "unknown order field: " & key)
   for key in ["hunch", "notes"]:
     let value = payload{key}
-    if value != nil and value.kind == JString and not scalarUtf8(value.getStr()):
-      raise newException(DaycareError, key & " must contain Unicode scalar UTF-8")
-  result.hunch = cleanHunch(payload{"hunch"}.getStr())
-  result.notes = cleanNotes(payload{"notes"}.getStr())
+    if not value.isNil and value.kind != JNull:
+      if value.kind != JString:
+        raise newException(DaycareError, key & " must be a string")
+      if not scalarUtf8(value.getStr()):
+        raise newException(DaycareError, key & " must contain Unicode scalar UTF-8")
+  let hunchNode = payload{"hunch"}
+  let notesNode = payload{"notes"}
+  result.hunch =
+    if not hunchNode.isNil and hunchNode.kind == JString:
+      cleanHunch(hunchNode.getStr())
+    else: ""
+  result.notes =
+    if not notesNode.isNil and notesNode.kind == JString:
+      cleanNotes(notesNode.getStr())
+    else: ""
   let jobNode = payload{"job"}
   if jobNode.isNil or jobNode.kind != JString:
     raise newException(DaycareError, "no job in response")
@@ -463,8 +499,9 @@ proc parseOrder*(role: Role, payload: JsonNode): Order =
   else:
     result.cjob = parseChildJob(jobNode.getStr())
   let fruitNode = payload{"fruit"}
-  if not fruitNode.isNil and fruitNode.kind == JString and
-      fruitNode.getStr().strip().len > 0:
+  if not fruitNode.isNil and fruitNode.kind != JNull:
+    if fruitNode.kind != JString:
+      raise newException(DaycareError, "fruit must be apple or banana")
     result.fruit = parseFruit(fruitNode.getStr())
     result.hasFruit = true
   if requiresFruit(role, result) and not result.hasFruit:
@@ -477,6 +514,10 @@ proc parseOrder*(role: Role, payload: JsonNode): Order =
         "the parent must send \"guess\": apple or banana every turn")
     result.guess = parseFruit(guessNode.getStr())
     result.hasGuess = true
+  else:
+    let guessNode = payload{"guess"}
+    if not guessNode.isNil and guessNode.kind != JNull:
+      raise newException(DaycareError, "child orders must not include guess")
 
 proc orderJson*(role: Role, order: Order): JsonNode =
   %*{"job": (if role == rParent: $order.pjob else: $order.cjob),
@@ -505,11 +546,10 @@ proc decideAll*(
   scripted: seq[ScriptKind],
   selection: PromptSelection
 ): seq[Order] =
-  ## One order per seat in `seats`, in order. NEVER RAISES: any failure falls
-  ## back to the `caretaker` order so the episode always advances.
-  ##
-  ## Both open seats ride ONE batch — decisions are simultaneous, and a
-  ## sequential pair would double the wall clock against the 720 s play budget.
+  ## One order per seat in `seats`, in order. Genuine scripted seats play their
+  ## declared baseline. Prompt seats ride ONE parallel batch per turn, retrying
+  ## once on failure; if credentials are missing or a prompt seat still fails,
+  ## this raises `DaycareError` instead of silently substituting a fallback move.
   result = newSeq[Order](seats.len)
   if client.capture != nil:
     client.captured = newSeq[CapturedDecision](2)
@@ -520,11 +560,14 @@ proc decideAll*(
   var open: seq[int]
   for index, seat in seats:
     let kind = scripted[seat]
-    if kind != skNone or client.disabled:
-      result[index] = scriptedOrder(sim, seat,
-        (if kind == skNone: skCaretaker else: kind))
+    if kind != skNone:
+      result[index] = scriptedOrder(sim, seat, kind)
     else:
+      if client.disabled:
+        raise newException(DaycareError,
+          "seat " & $seat & " requires an LLM decision but LLM client is disabled")
       open.add index
+  var lastErrors = newSeq[string](seats.len)
   for attempt in 0 .. 1:
     if open.len == 0 or client.disabled:
       break
@@ -565,13 +608,15 @@ proc decideAll*(
         result[index] = order
       except CatchableError as error:
         if client.capture != nil: client.captured[seat].rejectedAttempt(error.msg)
+        lastErrors[index] = cleanText(error.msg, MaxErrorTextLen)
         echo "daycare llm: seat ", seat, " attempt ", attempt, " failed: ",
-          cleanText(error.msg, MaxErrorTextLen)
+          lastErrors[index]
         stillOpen.add index
     open = stillOpen
-  for index in open:
+  if open.len > 0:
+    let index = open[0]
     let seat = seats[index]
-    echo "daycare llm: seat ", seat, " falling back to scripted order"
-    var order = scriptedOrder(sim, seat, skCaretaker)
-    order.source = osFallback
-    result[index] = order
+    let detail = if lastErrors[index].len > 0: lastErrors[index]
+      else: "no valid LLM order"
+    raise newException(DaycareError,
+      "seat " & $seat & " failed to produce a valid order: " & detail)
