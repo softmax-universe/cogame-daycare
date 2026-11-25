@@ -152,9 +152,15 @@ proc broadcastLocked(gs: var GameState) =
     let packet = buildViewerPacket(view, snap, chrome)
     gs.viewers[socket] = view
     gs.trackers[socket] = tracker
-    socket.send(blobFromBytes(packet), BinaryMessage)
+    try:
+      socket.send(blobFromBytes(packet), BinaryMessage)
+    except CatchableError:
+      discard
   for slot, socket in gs.playerSockets:
-    socket.send($gs.sim.playerStateJson(slot))
+    try:
+      socket.send($gs.sim.playerStateJson(slot))
+    except CatchableError:
+      discard
 
 # ---------------------------------------------------------------------------
 # artifacts and shutdown
@@ -334,24 +340,11 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
 
     let capture = newRuntimeCapture(config, runtimeConfig.resultsUri, runtimeConfig.replayUri)
 
-    if connected == 0:
-      ## Pre-existing rule (origin/main src/daycare/server.nim:269-278 &
-      ## src/daycare/sim.nim:406-411): when zero seats connect within
-      ## playerConnectTimeoutSeconds, settle as forfeit.
-      echo "daycare: no player connected within ",
-        config.playerConnectTimeoutSeconds, "s; forfeit"
-      withLock stateLock:
-        state.sim.forfeit()
-        state.broadcastLocked()
-      if capture != nil:
-        withLock stateLock: capture.finishCapture(state.sim.resultsJson())
-      finishEpisode(runtimeConfig)
-      return
-
     if connected < 2:
+      let failedSeat = if connected == 0: -1 else: missingSlot
       failEpisode(runtimeConfig, capture, @[], "player_error",
         "only " & $connected & "/2 players connected within " &
-        $config.playerConnectTimeoutSeconds & "s", seat = missingSlot)
+        $config.playerConnectTimeoutSeconds & "s", seat = failedSeat)
       return
 
     if unregisteredSlot >= 0:
@@ -398,22 +391,25 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
           if not state.playerSockets.hasKey(slot):
             disconnectedSlot = slot
             break
-        if disconnectedSlot >= 0:
-          break
-        state.sim.turn = turn
-        simCopy = state.sim
-        prompts = state.prompts
-        scriptedKinds = state.scripted
-        external = state.external
-        state.awaitingTurn = turn
-        for slot in 0 .. 1:
-          if external[slot]:
-            state.received[slot] = false
-            state.playerSockets[slot].send($ %*{
-              "type": "observation", "turn": turn,
-              "observation": state.sim.playerStateJson(slot)})
-          else:
-            nativeSeats.add slot
+        if disconnectedSlot < 0:
+          state.sim.turn = turn
+          simCopy = state.sim
+          prompts = state.prompts
+          scriptedKinds = state.scripted
+          external = state.external
+          state.awaitingTurn = turn
+          for slot in 0 .. 1:
+            if external[slot]:
+              state.received[slot] = false
+              try:
+                state.playerSockets[slot].send($ %*{
+                  "type": "observation", "turn": turn,
+                  "observation": state.sim.playerStateJson(slot)})
+              except CatchableError:
+                disconnectedSlot = slot
+                break
+            else:
+              nativeSeats.add slot
 
       if disconnectedSlot >= 0:
         failEpisode(runtimeConfig, capture, @[], "player_error",

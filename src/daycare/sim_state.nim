@@ -34,8 +34,8 @@ type
     turn*: int                   ## the turn being played, 1-based
     turnsPlayed*: int
     done*: bool
-    reason*: string              ## complete | deadline | forfeit
-    ending*: string              ## turn_limit | deadline | forfeit
+    reason*: string              ## complete | deadline
+    ending*: string              ## turn_limit | deadline
 
     guess*: Fruit
     hasGuess*: bool

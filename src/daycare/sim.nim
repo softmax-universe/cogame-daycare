@@ -403,13 +403,6 @@ proc endEarly*(sim: var Sim) =
   ## The play deadline fired between turns: score what was played and settle.
   sim.settle("deadline", "deadline")
 
-proc forfeit*(sim: var Sim) =
-  ## No seat connected within playerConnectTimeoutSeconds. All zero; results and
-  ## the replay are still written.
-  sim.cogs[0].score = 0
-  sim.cogs[1].score = 0
-  sim.settle("forfeit", "forfeit")
-
 proc playTurn*(sim: var Sim) =
   for _ in 1 .. sim.config.ticksPerTurn:
     sim.stepTick()

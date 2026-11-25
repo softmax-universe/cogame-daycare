@@ -199,9 +199,9 @@ block:
     doAssert key in results["required"].to(seq[string]),
       key & " is not required in results_schema"
   doAssert results["properties"]["reason"]["enum"].to(seq[string]) ==
-    @["complete", "deadline", "forfeit"]
+    @["complete", "deadline"]
   doAssert results["properties"]["ending"]["enum"].to(seq[string]) ==
-    @["turn_limit", "deadline", "forfeit"]
+    @["turn_limit", "deadline"]
   doAssert results["properties"]["preference"]["enum"].to(seq[string]) ==
     @["apple", "banana"]
 
